@@ -1,0 +1,14 @@
+digraph {
+{ rank=source; "a"; }
+{ rank=source; "b"; }
+{ 7 [label ="Add", shape=rectangle]; }
+"a" -> 7
+"b" -> 7
+{ "t0"; }
+7 -> "t0"
+{ 8 [label ="Subtract", shape=rectangle]; }
+"t0" -> 8
+"b" -> 8
+{ "t1"; }
+8 -> "t1"
+}

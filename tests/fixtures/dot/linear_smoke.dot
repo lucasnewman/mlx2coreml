@@ -1,0 +1,21 @@
+digraph {
+{ rank=source; "x"; }
+{ rank=source; "w"; }
+{ 10 [label ="Matmul", shape=rectangle]; }
+"x" -> 10
+"w" -> 10
+{ "mm"; }
+10 -> "mm"
+{ rank=source; "b"; }
+{ 20 [label ="Add", shape=rectangle]; }
+"mm" -> 20
+"b" -> 20
+{ "pre"; }
+20 -> "pre"
+{ rank=source; "z"; }
+{ 30 [label ="Maximum", shape=rectangle]; }
+"pre" -> 30
+"z" -> 30
+{ rank=sink; "out"; }
+30 -> "out"
+}

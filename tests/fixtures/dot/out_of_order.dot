@@ -1,0 +1,15 @@
+digraph {
+{ rank=source; "x"; }
+{ rank=source; "y"; }
+{ rank=source; "z"; }
+{ 1 [label ="Multiply", shape=rectangle]; }
+"t0" -> 1
+"z" -> 1
+{ rank=sink; "out"; }
+1 -> "out"
+{ 2 [label ="Add", shape=rectangle]; }
+"x" -> 2
+"y" -> 2
+{ "t0"; }
+2 -> "t0"
+}
