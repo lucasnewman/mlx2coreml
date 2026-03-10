@@ -159,6 +159,46 @@ class CallbackCaptureParserTests(unittest.TestCase):
         self.assertEqual(attrs["has_sinks"], False)
         self.assertEqual(attrs["output_logsumexp"], False)
 
+    def test_slice_update_arguments_are_parsed(self) -> None:
+        events = [
+            {
+                "type": "inputs",
+                "inputs": [
+                    ("X", (1, 8, 256, 128), "mlx.core.float16"),
+                    ("U", (1, 8, 8, 128), "mlx.core.float16"),
+                ],
+            },
+            {"type": "keyword_inputs", "keywords": [("x", "X"), ("u", "U")]},
+            {"type": "outputs", "outputs": [("Y", (1, 8, 256, 128), "mlx.core.float16")]},
+            {"type": "constants", "constants": []},
+            {
+                "type": "primitive",
+                "name": "SliceUpdate",
+                "inputs": [
+                    ("X", (1, 8, 256, 128), "mlx.core.float16"),
+                    ("U", (1, 8, 8, 128), "mlx.core.float16"),
+                ],
+                "outputs": [("Y", (1, 8, 256, 128), "mlx.core.float16")],
+                "arguments": [(0, 0, 0, 0), (1, 8, 8, 128), (1, 1, 1, 1)],
+            },
+        ]
+
+        graph = parse_mlx_export_events_to_graph(
+            events=events,
+            input_specs=[
+                TensorSpec(name="x", shape=(1, 8, 256, 128), dtype="fp16"),
+                TensorSpec(name="u", shape=(1, 8, 8, 128), dtype="fp16"),
+            ],
+            allow_unknown_sources=False,
+        )
+
+        self.assertEqual([node.op for node in graph.nodes], ["slice_update"])
+        attrs = graph.nodes[0].attrs
+        self.assertEqual(attrs["begin"], [0, 0, 0, 0])
+        self.assertEqual(attrs["end"], [1, 8, 8, 128])
+        self.assertEqual(attrs["stride"], [1, 1, 1, 1])
+        self.assertEqual(graph.nodes[0].inputs, ("x", "u"))
+
 
 
     def test_bfloat16_dtype_widens_to_fp32(self) -> None:
@@ -264,6 +304,140 @@ class CallbackCaptureParserTests(unittest.TestCase):
         self.assertEqual(graph.nodes[0].attrs["axis"], 0)
         self.assertEqual(graph.nodes[0].attrs["shape"], [1, 4, 1, 8])
         self.assertEqual(graph.nodes[1].attrs["axes"], [2])
+
+    def test_split_expanddims_and_convolution_arguments_are_parsed(self) -> None:
+        events = [
+            {
+                "type": "inputs",
+                "inputs": [
+                    ("A", (1, 9, 4), "mlx.core.float16"),
+                    ("W", (4, 3, 1), "mlx.core.float16"),
+                ],
+            },
+            {"type": "keyword_inputs", "keywords": [("x", "A"), ("w", "W")]},
+            {"type": "outputs", "outputs": [("E", (1, 7, 1, 2), "mlx.core.float16")]},
+            {"type": "constants", "constants": []},
+            {
+                "type": "primitive",
+                "name": "Convolution",
+                "inputs": [
+                    ("A", (1, 9, 4), "mlx.core.float16"),
+                    ("W", (4, 3, 1), "mlx.core.float16"),
+                ],
+                "outputs": [("B", (1, 7, 4), "mlx.core.float16")],
+                "arguments": [[1], [0], [0], [1], [1], 4, False],
+            },
+            {
+                "type": "primitive",
+                "name": "Split",
+                "inputs": [("B", (1, 7, 4), "mlx.core.float16")],
+                "outputs": [
+                    ("C0", (1, 7, 2), "mlx.core.float16"),
+                    ("C1", (1, 7, 2), "mlx.core.float16"),
+                ],
+                "arguments": [(2,), 2],
+            },
+            {
+                "type": "primitive",
+                "name": "ExpandDims",
+                "inputs": [("C0", (1, 7, 2), "mlx.core.float16")],
+                "outputs": [("D", (1, 7, 1, 2), "mlx.core.float16")],
+                "arguments": [[2]],
+            },
+            {
+                "type": "primitive",
+                "name": "Exp",
+                "inputs": [("D", (1, 7, 1, 2), "mlx.core.float16")],
+                "outputs": [("E", (1, 7, 1, 2), "mlx.core.float16")],
+                "arguments": [],
+            },
+        ]
+
+        graph = parse_mlx_export_events_to_graph(
+            events=events,
+            input_specs=[
+                TensorSpec(name="x", shape=(1, 9, 4), dtype="fp16"),
+                TensorSpec(name="w", shape=(4, 3, 1), dtype="fp16"),
+            ],
+            allow_unknown_sources=False,
+        )
+
+        self.assertEqual(
+            [node.op for node in graph.nodes],
+            ["convolution", "split", "split", "expanddims", "exp"],
+        )
+
+        conv_attrs = graph.nodes[0].attrs
+        self.assertEqual(conv_attrs["strides"], [1])
+        self.assertEqual(conv_attrs["padding"], [0])
+        self.assertEqual(conv_attrs["dilations"], [1])
+        self.assertEqual(conv_attrs["groups"], 4)
+        self.assertEqual(conv_attrs["transpose"], False)
+
+        split_attrs_0 = graph.nodes[1].attrs
+        split_attrs_1 = graph.nodes[2].attrs
+        self.assertEqual(split_attrs_0["split_indices"], [2])
+        self.assertEqual(split_attrs_0["axis"], 2)
+        self.assertEqual(split_attrs_0["output_index"], 0)
+        self.assertEqual(split_attrs_1["output_index"], 1)
+        self.assertEqual(split_attrs_0["num_outputs"], 2)
+
+        self.assertEqual(graph.nodes[3].attrs["axes"], [2])
+        self.assertEqual(graph.nodes[4].attrs, {})
+
+    def test_reduce_arguments_are_parsed(self) -> None:
+        events = [
+            {"type": "inputs", "inputs": [("A", (2, 3, 4), "mlx.core.float32")]},
+            {"type": "keyword_inputs", "keywords": [("x", "A")]},
+            {"type": "outputs", "outputs": [("B", (2, 3, 1), "mlx.core.float32")]},
+            {"type": "constants", "constants": []},
+            {
+                "type": "primitive",
+                "name": "Reduce",
+                "inputs": [("A", (2, 3, 4), "mlx.core.float32")],
+                "outputs": [("B", (2, 3, 1), "mlx.core.float32")],
+                "arguments": [2, [2]],
+            },
+        ]
+
+        graph = parse_mlx_export_events_to_graph(
+            events=events,
+            input_specs=[TensorSpec(name="x", shape=(2, 3, 4), dtype="fp32")],
+            allow_unknown_sources=False,
+        )
+
+        self.assertEqual([node.op for node in graph.nodes], ["reduce"])
+        attrs = graph.nodes[0].attrs
+        self.assertEqual(attrs["mode"], 2)
+        self.assertEqual(attrs["axes"], [2])
+        self.assertEqual(attrs["keep_dims"], True)
+
+    def test_slice_arguments_are_parsed(self) -> None:
+        events = [
+            {"type": "inputs", "inputs": [("A", (1, 96, 16), "mlx.core.float16")]},
+            {"type": "keyword_inputs", "keywords": [("x", "A")]},
+            {"type": "outputs", "outputs": [("B", (1, 1, 16), "mlx.core.float16")]},
+            {"type": "constants", "constants": []},
+            {
+                "type": "primitive",
+                "name": "Slice",
+                "inputs": [("A", (1, 96, 16), "mlx.core.float16")],
+                "outputs": [("B", (1, 1, 16), "mlx.core.float16")],
+                "arguments": [(0, 2, 0), (1, 3, 16), (1, 1, 1)],
+            },
+        ]
+
+        graph = parse_mlx_export_events_to_graph(
+            events=events,
+            input_specs=[TensorSpec(name="x", shape=(1, 96, 16), dtype="fp16")],
+            allow_unknown_sources=False,
+        )
+
+        self.assertEqual([node.op for node in graph.nodes], ["slice"])
+        attrs = graph.nodes[0].attrs
+        self.assertEqual(attrs["begin"], [0, 2, 0])
+        self.assertEqual(attrs["end"], [1, 3, 16])
+        self.assertEqual(attrs["stride"], [1, 1, 1])
 
 
 if __name__ == "__main__":

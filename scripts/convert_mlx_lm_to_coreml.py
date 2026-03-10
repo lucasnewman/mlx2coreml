@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 import json
 import re
 import sys
@@ -14,14 +15,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mlx2coreml.from_mlx import capture_graph_from_mlx_function
+from mlx2coreml.compute_plan import analyze_compiled_model_placement
 from mlx2coreml.lower_to_mil import (
     build_mil_program,
     compile_model_artifact,
     convert_program_to_model,
 )
+from mlx2coreml.ir import Graph, Node, StateSpec, TensorSpec
 from mlx2coreml.op_registry import ensure_supported, unsupported_op_details
 from mlx2coreml.passes import infer_graph_specs, normalize_graph, summarize_inference
-from mlx2coreml.reporting import build_run_context, write_json
+from mlx2coreml.reporting import (
+    build_run_context,
+    init_stage_timings,
+    summarize_stage_timings,
+    timed_stage,
+    write_json,
+)
 
 
 def parse_deployment_target(target_name: str):
@@ -89,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         help="Core ML minimum deployment target (for example: iOS18).",
     )
     parser.add_argument(
+        "--target-profile",
+        default="default",
+        choices=["default", "ane_ios18", "conservative"],
+        help="Lowering profile used to control rewrite aggressiveness.",
+    )
+    parser.add_argument(
         "--convert-to",
         default="mlprogram",
         choices=["mlprogram", "neuralnetwork"],
@@ -122,12 +137,70 @@ def parse_args() -> argparse.Namespace:
         help="Skip model compilation to .mlmodelc.",
     )
     parser.add_argument(
+        "--state-specs-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file defining Core ML state specs, for example: "
+            "[{\"name\":\"kv_cache\",\"shape\":[1,32,128,64],\"dtype\":\"fp16\"}]"
+        ),
+    )
+    parser.add_argument(
+        "--analyze-placement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Analyze compiled model placement using Core ML compute-plan APIs and include "
+            "fallback counts in reports."
+        ),
+    )
+    parser.add_argument(
+        "--flex-input-lens",
+        default=None,
+        help=(
+            "Optional comma-separated token lengths for flexible input shapes "
+            "(for example: 1,16,64). Use 'auto' to enable preset [1, seq_len]."
+        ),
+    )
+    parser.add_argument(
+        "--flex-input-names",
+        default="input_ids,attention_mask,position_ids,token_type_ids",
+        help=(
+            "Comma-separated input names eligible for flexible sequence length handling "
+            "when --flex-input-lens is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--argmax-in-model",
+        default="off",
+        choices=["off", "index", "index_and_value"],
+        help=(
+            "Optionally append argmax reduction to model outputs to reduce host transfer size. "
+            "'index' emits argmax indices only, 'index_and_value' emits both index and max value."
+        ),
+    )
+    parser.add_argument(
+        "--argmax-axis",
+        type=int,
+        default=-1,
+        help="Axis used for --argmax-in-model output reduction.",
+    )
+    parser.add_argument(
         "--allow-unknown-sources",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
             "Allow parser to keep source nodes without explicit input specs. "
             "Enabled by default for robust model capture."
+        ),
+    )
+    parser.add_argument(
+        "--capture-is-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Temporarily set the MLX model to training mode during graph export capture. "
+            "Useful for models whose eval path uses fast custom kernels that are harder to lower."
         ),
     )
     return parser.parse_args()
@@ -170,9 +243,287 @@ def _select_primary_output(value: Any) -> Any:
     return value
 
 
+@contextmanager
+def _temporary_capture_training_mode(model: Any, enabled: bool):
+    if not bool(enabled):
+        yield
+        return
+
+    prior_training: bool | None = None
+    if hasattr(model, "training"):
+        try:
+            prior_training = bool(getattr(model, "training"))
+        except Exception:
+            prior_training = None
+
+    prior_is_training: bool | None = None
+    had_is_training = hasattr(model, "is_training")
+    if had_is_training:
+        try:
+            prior_is_training = bool(getattr(model, "is_training"))
+        except Exception:
+            prior_is_training = None
+
+    train_fn = getattr(model, "train", None)
+    eval_fn = getattr(model, "eval", None)
+
+    if callable(train_fn):
+        train_fn()
+    elif hasattr(model, "training"):
+        try:
+            setattr(model, "training", True)
+        except Exception:
+            pass
+
+    if had_is_training:
+        try:
+            setattr(model, "is_training", True)
+        except Exception:
+            pass
+
+    try:
+        yield
+    finally:
+        if prior_training is not None:
+            if prior_training and callable(train_fn):
+                train_fn()
+            elif (not prior_training) and callable(eval_fn):
+                eval_fn()
+            elif hasattr(model, "training"):
+                try:
+                    setattr(model, "training", prior_training)
+                except Exception:
+                    pass
+
+        if had_is_training and prior_is_training is not None:
+            try:
+                setattr(model, "is_training", prior_is_training)
+            except Exception:
+                pass
+
+
 def _top_ops(graph_ops: list[str]) -> list[list[Any]]:
     ranked = sorted(Counter(graph_ops).items(), key=lambda item: (-item[1], item[0]))
     return [[name, int(count)] for name, count in ranked]
+
+
+def _parse_flex_lengths(raw: str | None, *, seq_len: int) -> list[int] | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in {"auto", "preset"}:
+        lengths = [1, int(seq_len)]
+    else:
+        lengths = [int(part.strip()) for part in text.split(",") if part.strip()]
+    if not lengths:
+        raise ValueError("--flex-input-lens did not contain any values.")
+    normalized: list[int] = []
+    for value in lengths:
+        if int(value) <= 0:
+            raise ValueError(f"--flex-input-lens values must be positive, got {value}.")
+        ivalue = int(value)
+        if ivalue not in normalized:
+            normalized.append(ivalue)
+    if 1 not in normalized:
+        normalized.insert(0, 1)
+    if int(seq_len) not in normalized:
+        normalized.append(int(seq_len))
+    return normalized
+
+
+def _parse_flex_input_names(raw: str) -> set[str]:
+    names = [name.strip() for name in str(raw).split(",") if name.strip()]
+    return set(names)
+
+
+def _tensor_spec_numpy_dtype(spec: TensorSpec) -> Any:
+    mapping = {
+        "fp16": np.float16,
+        "fp32": np.float32,
+        "int32": np.int32,
+        "int64": np.int64,
+        "bool": np.bool_,
+    }
+    if spec.dtype not in mapping:
+        raise ValueError(
+            f"Unsupported TensorSpec dtype '{spec.dtype}' for conversion inputs."
+        )
+    return mapping[spec.dtype]
+
+
+def _build_conversion_inputs(
+    input_specs: list[TensorSpec],
+    *,
+    flex_input_lens: list[int] | None,
+    flex_input_names: set[str],
+) -> tuple[list[Any] | None, dict[str, list[list[int]]]]:
+    if flex_input_lens is None:
+        return None, {}
+
+    converted_inputs: list[Any] = []
+    applied_shapes: dict[str, list[list[int]]] = {}
+    for spec in input_specs:
+        base_shape = tuple(int(v) for v in spec.shape)
+        dtype = _tensor_spec_numpy_dtype(spec)
+
+        if spec.name in flex_input_names and len(base_shape) >= 1:
+            enumerated: list[tuple[int, ...]] = [base_shape]
+            for seq_len in flex_input_lens:
+                shape = list(base_shape)
+                shape[-1] = int(seq_len)
+                candidate = tuple(shape)
+                if candidate not in enumerated:
+                    enumerated.append(candidate)
+            if len(enumerated) > 1:
+                converted_inputs.append(
+                    ct.TensorType(
+                        name=spec.name,
+                        shape=ct.EnumeratedShapes(shapes=enumerated),
+                        dtype=dtype,
+                    )
+                )
+                applied_shapes[spec.name] = [list(shape) for shape in enumerated]
+                continue
+
+        converted_inputs.append(ct.TensorType(name=spec.name, shape=base_shape, dtype=dtype))
+
+    return converted_inputs, applied_shapes
+
+
+def _load_state_specs(path: Path | None) -> list[StateSpec] | None:
+    if path is None:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    entries = payload.get("states") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"--state-specs-json must contain a list or a dict with 'states' list, got {type(entries).__name__}."
+        )
+
+    specs: list[StateSpec] = []
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"State spec at index {idx} must be an object, got {type(entry).__name__}.")
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"State spec at index {idx} is missing non-empty 'name'.")
+        shape_raw = entry.get("shape")
+        if not isinstance(shape_raw, (list, tuple)):
+            raise ValueError(f"State spec '{name}' must provide 'shape' as a list.")
+        shape = tuple(int(v) for v in shape_raw)
+        if any(int(v) <= 0 for v in shape):
+            raise ValueError(f"State spec '{name}' has non-positive shape dimension(s): {shape}.")
+        dtype = str(entry.get("dtype", "fp16")).strip().lower()
+        specs.append(StateSpec(name=name, shape=shape, dtype=dtype))
+    return specs
+
+
+def _unique_tensor_name(base: str, taken: set[str]) -> str:
+    candidate = base
+    index = 1
+    while candidate in taken:
+        candidate = f"{base}_{index}"
+        index += 1
+    return candidate
+
+
+def _apply_argmax_output_reduction(
+    graph: Graph,
+    expected: dict[str, np.ndarray],
+    *,
+    mode: str,
+    axis: int,
+) -> tuple[Graph, dict[str, np.ndarray], dict[str, Any]]:
+    if mode == "off":
+        return graph, expected, {"enabled": False}
+    if mode not in {"index", "index_and_value"}:
+        raise ValueError(f"Unsupported argmax mode: {mode}")
+    if not graph.outputs:
+        raise ValueError("Cannot apply argmax output reduction: graph has no outputs.")
+    if not expected:
+        raise ValueError("Cannot apply argmax output reduction: expected outputs are empty.")
+
+    source_output = graph.outputs[0]
+    source_expected = np.asarray(next(iter(expected.values())))
+    if source_expected.ndim == 0:
+        raise ValueError(
+            "Cannot apply argmax output reduction to scalar output."
+        )
+    axis_norm = int(axis)
+    if axis_norm < 0:
+        axis_norm += source_expected.ndim
+    if axis_norm < 0 or axis_norm >= source_expected.ndim:
+        raise ValueError(
+            f"--argmax-axis out of range for output rank {source_expected.ndim}: {axis}"
+        )
+
+    taken_names = {spec.name for spec in graph.inputs}
+    taken_names.update(node.output for node in graph.nodes)
+    taken_names.update(graph.outputs)
+
+    index_output_name = _unique_tensor_name(f"{source_output}_argmax_idx", taken_names)
+    taken_names.add(index_output_name)
+
+    nodes = list(graph.nodes)
+    nodes.append(
+        Node(
+            op="argmax",
+            inputs=(source_output,),
+            output=index_output_name,
+            attrs={"axis": axis_norm, "keep_dims": False},
+        )
+    )
+    outputs = [index_output_name]
+    reduced_expected: dict[str, np.ndarray] = {
+        index_output_name: np.argmax(source_expected, axis=axis_norm).astype(np.int32),
+    }
+
+    value_output_name = None
+    if mode == "index_and_value":
+        value_output_name = _unique_tensor_name(f"{source_output}_argmax_val", taken_names)
+        nodes.append(
+            Node(
+                op="max",
+                inputs=(source_output,),
+                output=value_output_name,
+                attrs={"axes": [axis_norm], "keep_dims": False},
+            )
+        )
+        outputs.append(value_output_name)
+        reduced_expected[value_output_name] = np.max(source_expected, axis=axis_norm)
+
+    reduced_graph = Graph(inputs=list(graph.inputs), nodes=nodes, outputs=outputs)
+    reduced_graph.validate()
+    return (
+        reduced_graph,
+        reduced_expected,
+        {
+            "enabled": True,
+            "mode": mode,
+            "axis": axis_norm,
+            "source_output": source_output,
+            "reduced_outputs": list(outputs),
+            "value_output": value_output_name,
+        },
+    )
+
+
+def _normalize_graph_for_function(
+    graph: Graph,
+    expected: dict[str, np.ndarray],
+    *,
+    argmax_mode: str,
+    argmax_axis: int,
+) -> tuple[Graph, dict[str, np.ndarray], dict[str, Any], list[list[Any]]]:
+    normalized_graph = normalize_graph(graph)
+    normalized_graph, expected, argmax_reduction = _apply_argmax_output_reduction(
+        normalized_graph,
+        expected,
+        mode=argmax_mode,
+        axis=argmax_axis,
+    )
+    graph_ops = [node.op for node in normalized_graph.nodes]
+    return normalized_graph, expected, argmax_reduction, _top_ops(graph_ops)
 
 
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
@@ -186,11 +537,18 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- Seq length: `{report['seq_len']}`",
         f"- Status: `{report['status']}`",
         f"- Stage status: `{json.dumps(report['stage_status'], sort_keys=True)}`",
+        f"- Stage durations (sec): `{json.dumps(report['stage_durations_sec'], sort_keys=True)}`",
+        f"- Total stage duration (sec): `{report['total_duration_sec']}`",
         f"- Ops clean: `{report['ops_clean']}`",
         f"- Weights captured as constants: `{report['weights_captured_as_constants']}`",
         f"- Extra non-user inputs: `{report['extra_input_count']}`",
         f"- Unsupported ops: `{report['unsupported_op_count']}`",
+        f"- Fallback ops: `{report['fallback_op_count']}`",
         f"- Capture mode: `{report['capture_mode']}`",
+        f"- Target profile: `{report['run_context']['target_profile']}`",
+        f"- Argmax in model: `{report['argmax_in_model']}`",
+        f"- Argmax axis: `{report['argmax_axis']}`",
+        f"- State specs: `{json.dumps(report['state_specs'])}`",
         f"- Deployment target: `{report['run_context']['deployment_target']}`",
         f"- Conversion backend: `{report['run_context']['convert_to']}`",
         f"- Compute precision: `{report['run_context']['compute_precision']}`",
@@ -211,6 +569,8 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         lines.append(f"- Model artifact: `{report['artifacts']['model']}`")
     if compiled:
         lines.append(f"- Compiled artifact: `{compiled}`")
+    if report.get("flex_input_shapes"):
+        lines.append(f"- Flexible input shapes: `{json.dumps(report['flex_input_shapes'], sort_keys=True)}`")
     if report["extra_input_names_sample"]:
         lines.append(
             f"- Extra input names sample: `{', '.join(report['extra_input_names_sample'])}`"
@@ -223,6 +583,13 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         )
     if top_ops_str:
         lines.append(f"- Top ops: {top_ops_str}")
+    if report["top_fallback_ops"]:
+        fallback_ops_str = ", ".join(
+            f"`{name}` x{count}" for name, count in report["top_fallback_ops"]
+        )
+        lines.append(f"- Top fallback ops: {fallback_ops_str}")
+    if report.get("placement_error"):
+        lines.append(f"- Placement analysis error: `{report['placement_error']}`")
     if report["unsupported_ops"]:
         lines.append("- Unsupported op details:")
         for detail in report["unsupported_ops"]:
@@ -242,6 +609,9 @@ def main() -> None:
     skip_lower = bool(args.skip_lower)
     skip_convert = bool(args.skip_convert or skip_lower)
     skip_compile = bool(args.skip_compile or skip_convert)
+    flex_input_lens = _parse_flex_lengths(args.flex_input_lens, seq_len=int(args.seq_len))
+    flex_input_names = _parse_flex_input_names(args.flex_input_names)
+    state_specs = _load_state_specs(args.state_specs_json)
 
     run_name = args.run_name or _sanitize_run_name(args.model_id)
     run_dir = args.artifacts_dir / run_name
@@ -266,6 +636,7 @@ def main() -> None:
     )
     run_context["model_id"] = args.model_id
     run_context["capture_mode"] = args.capture_mode
+    run_context["target_profile"] = args.target_profile
     run_context["compute_precision"] = args.compute_precision
     run_context["compute_units"] = args.compute_units
     run_context["prompt"] = args.prompt
@@ -273,6 +644,14 @@ def main() -> None:
     run_context["revision"] = args.revision
     run_context["lazy_load"] = bool(args.lazy_load)
     run_context["allow_unknown_sources"] = bool(args.allow_unknown_sources)
+    run_context["capture_is_training"] = bool(args.capture_is_training)
+    run_context["analyze_placement"] = bool(args.analyze_placement)
+    run_context["flex_input_lens"] = list(flex_input_lens) if flex_input_lens is not None else None
+    run_context["flex_input_names"] = sorted(flex_input_names)
+    run_context["state_specs_json"] = str(args.state_specs_json) if args.state_specs_json else None
+    run_context["state_specs"] = [spec.to_dict() for spec in state_specs] if state_specs else []
+    run_context["argmax_in_model"] = args.argmax_in_model
+    run_context["argmax_axis"] = int(args.argmax_axis)
     write_json(run_context_path, run_context)
 
     stage_status = {
@@ -285,53 +664,83 @@ def main() -> None:
         "lower": "skipped" if skip_lower else "pending",
         "convert": "skipped" if skip_convert else "pending",
         "compile": "skipped" if skip_compile else "pending",
+        "placement_analysis": (
+            "pending" if (not skip_compile and bool(args.analyze_placement)) else "skipped"
+        ),
     }
+    stage_timings = init_stage_timings(stage_status.keys())
 
-    graph_ops: list[str] = []
+    main_function_name = "main"
     op_counts: list[list[Any]] = []
     unsupported_details: list[dict[str, Any]] = []
     extra_input_names: list[str] = []
+    flex_input_shapes: dict[str, list[list[int]]] = {}
     inference_summary: dict[str, int] | None = None
+    argmax_reduction: dict[str, Any] = {"enabled": False}
+    normalized_graph: Graph | None = None
+    normalized_inputs: dict[str, np.ndarray] = {}
+    expected: dict[str, np.ndarray] = {}
+    function_artifacts: dict[str, dict[str, str]] = {}
     saved_model_path: Path | None = None
     saved_compiled_path: Path | None = None
+    placement_analysis: dict[str, Any] | None = None
+    placement_error: str | None = None
     error_message: str | None = None
 
     try:
-        from mlx_lm import load
+        with timed_stage(stage_timings, "load_model"):
+            from mlx_lm import load
 
-        model, tokenizer = load(args.model_id, lazy=args.lazy_load, revision=args.revision)
-        if hasattr(model, "eval"):
-            model.eval()
+            model, tokenizer = load(args.model_id, lazy=args.lazy_load, revision=args.revision)
+            if hasattr(model, "eval"):
+                model.eval()
         stage_status["load_model"] = "ok"
 
-        input_ids = _tokenize_prompt(tokenizer, args.prompt, args.seq_len)
-        inputs = {"input_ids": input_ids}
+        with timed_stage(stage_timings, "tokenize"):
+            input_ids = _tokenize_prompt(tokenizer, args.prompt, args.seq_len)
+            inputs = {"input_ids": input_ids}
         stage_status["tokenize"] = "ok"
 
-        graph, normalized_inputs, expected = capture_graph_from_mlx_function(
-            dot_output_path=dot_path,
-            inputs=inputs,
-            function=lambda input_ids: _select_primary_output(model(input_ids)),
-            allow_unknown_sources=args.allow_unknown_sources,
-            capture_mode=args.capture_mode,
-        )
-        stage_status["capture"] = "ok"
+        with _temporary_capture_training_mode(model, enabled=bool(args.capture_is_training)):
+            with timed_stage(stage_timings, "capture"):
+                graph, normalized_inputs, expected = capture_graph_from_mlx_function(
+                    dot_output_path=dot_path,
+                    inputs=inputs,
+                    function=lambda input_ids: _select_primary_output(model(input_ids)),
+                    allow_unknown_sources=args.allow_unknown_sources,
+                    capture_mode=args.capture_mode,
+                )
+            stage_status["capture"] = "ok"
 
+            function_artifacts["main"] = {
+                "capture_dot": str(dot_path),
+                "graph_json": str(graph_json_path),
+                "inputs": str(inputs_path),
+                "expected": str(expected_path),
+            }
         graph_json_path.write_text(json.dumps(graph.to_dict(), indent=2) + "\n", encoding="utf-8")
         np.savez(inputs_path, **normalized_inputs)
+
+        with timed_stage(stage_timings, "normalize"):
+            normalized_graph, expected, argmax_reduction, op_counts = _normalize_graph_for_function(
+                graph,
+                expected,
+                argmax_mode=args.argmax_in_model,
+                argmax_axis=int(args.argmax_axis),
+            )
+        stage_status["normalize"] = "ok"
         np.savez(expected_path, **expected)
 
-        normalized_graph = normalize_graph(graph)
-        graph_ops = [node.op for node in normalized_graph.nodes]
-        op_counts = _top_ops(graph_ops)
-        stage_status["normalize"] = "ok"
-
-        inferred = infer_graph_specs(normalized_graph)
-        inference_summary = summarize_inference(inferred)
+        with timed_stage(stage_timings, "type_infer"):
+            assert normalized_graph is not None
+            inferred = infer_graph_specs(normalized_graph)
+            inference_summary = summarize_inference(inferred)
         stage_status["type_infer"] = "ok"
 
-        unsupported_details = unsupported_op_details(normalized_graph)
-        ensure_supported(normalized_graph)
+        with timed_stage(stage_timings, "support_check"):
+            assert normalized_graph is not None
+            unsupported_details = unsupported_op_details(normalized_graph)
+            ensure_supported(normalized_graph)
         stage_status["support_check"] = "ok"
 
         input_names = set(normalized_inputs.keys())
@@ -339,9 +748,17 @@ def main() -> None:
 
         program = None
         if not skip_lower:
-            target = parse_deployment_target(args.deployment_target)
-            program = build_mil_program(normalized_graph, deployment_target=target, normalize=False)
-            mil_path.write_text(str(program) + "\n", encoding="utf-8")
+            with timed_stage(stage_timings, "lower"):
+                target = parse_deployment_target(args.deployment_target)
+                assert normalized_graph is not None
+                program = build_mil_program(
+                    normalized_graph,
+                    deployment_target=target,
+                    normalize=False,
+                    target_profile=args.target_profile,
+                    shared_state_specs=state_specs,
+                )
+                mil_path.write_text(str(program) + "\n", encoding="utf-8")
             stage_status["lower"] = "ok"
 
         converted = None
@@ -349,22 +766,44 @@ def main() -> None:
             if program is None:
                 raise RuntimeError("Internal error: program missing before convert stage.")
             target = parse_deployment_target(args.deployment_target)
-            converted = convert_program_to_model(
-                program,
-                deployment_target=target,
-                convert_to=args.convert_to,
-                compute_precision=args.compute_precision,
-                compute_units=args.compute_units,
-            )
-            converted.save(str(model_path))
+            assert normalized_graph is not None
+            with timed_stage(stage_timings, "convert"):
+                conversion_inputs, flex_input_shapes = _build_conversion_inputs(
+                    normalized_graph.inputs,
+                    flex_input_lens=flex_input_lens,
+                    flex_input_names=flex_input_names,
+                )
+                converted = convert_program_to_model(
+                    program,
+                    deployment_target=target,
+                    convert_to=args.convert_to,
+                    compute_precision=args.compute_precision,
+                    compute_units=args.compute_units,
+                    inputs=conversion_inputs,
+                    state_specs=state_specs,
+                )
+                converted.save(str(model_path))
+            function_artifacts["main"]["model"] = str(model_path)
             saved_model_path = model_path
             stage_status["convert"] = "ok"
 
         if not skip_compile:
             if converted is None and saved_model_path is None:
                 raise RuntimeError("Internal error: converted model missing before compile stage.")
-            saved_compiled_path = compile_model_artifact(model_path, compiled_path)
+            with timed_stage(stage_timings, "compile"):
+                saved_compiled_path = compile_model_artifact(model_path, compiled_path)
             stage_status["compile"] = "ok"
+            if stage_status["placement_analysis"] == "pending":
+                try:
+                    with timed_stage(stage_timings, "placement_analysis"):
+                        placement_analysis = analyze_compiled_model_placement(
+                            saved_compiled_path,
+                            compute_units=args.compute_units,
+                        )
+                    stage_status["placement_analysis"] = "ok"
+                except Exception as exc:  # pragma: no cover - environment-dependent APIs
+                    placement_error = str(exc)
+                    stage_status["placement_analysis"] = "failed"
 
     except Exception as exc:
         error_message = str(exc)
@@ -372,8 +811,15 @@ def main() -> None:
         if pending_stage is not None:
             stage_status[pending_stage] = "failed"
 
+    stage_durations_sec, total_duration_sec = summarize_stage_timings(stage_timings)
     unsupported_count = len(unsupported_details)
     weights_captured_as_constants = len(extra_input_names) == 0
+    inference_by_function = {main_function_name: inference_summary} if inference_summary is not None else {}
+    unsupported_by_function = {main_function_name: unsupported_details}
+    argmax_by_function = {main_function_name: argmax_reduction}
+    flex_input_shapes_by_function = (
+        {main_function_name: flex_input_shapes} if flex_input_shapes else {}
+    )
     report_json = {
         "schema_version": run_context["schema_version"],
         "run_kind": "mlx_lm_weighted_probe",
@@ -382,14 +828,36 @@ def main() -> None:
         "prompt": args.prompt,
         "seq_len": int(args.seq_len),
         "capture_mode": args.capture_mode,
+        "main_function": main_function_name,
+        "argmax_in_model": args.argmax_in_model,
+        "argmax_axis": int(args.argmax_axis),
+        "argmax_reduction": argmax_reduction,
+        "argmax_by_function": argmax_by_function,
+        "inference_by_function": inference_by_function,
+        "unsupported_by_function": unsupported_by_function,
+        "state_specs": [spec.to_dict() for spec in state_specs] if state_specs else [],
         "status": "ok" if error_message is None else "failed",
         "stage_status": stage_status,
+        "stage_durations_sec": stage_durations_sec,
+        "total_duration_sec": total_duration_sec,
         "ops_clean": bool(unsupported_count == 0 and weights_captured_as_constants),
         "weights_captured_as_constants": bool(weights_captured_as_constants),
         "extra_input_count": len(extra_input_names),
         "extra_input_names_sample": extra_input_names[:25],
+        "flex_input_lens": list(flex_input_lens) if flex_input_lens is not None else None,
+        "flex_input_names": sorted(flex_input_names),
+        "flex_input_shapes": flex_input_shapes,
+        "flex_input_shapes_by_function": flex_input_shapes_by_function,
         "unsupported_op_count": unsupported_count,
         "unsupported_ops": unsupported_details,
+        "fallback_op_count": (
+            int(placement_analysis["fallback_operation_count"]) if placement_analysis is not None else None
+        ),
+        "top_fallback_ops": (
+            placement_analysis.get("top_fallback_ops", []) if placement_analysis is not None else []
+        ),
+        "placement_analysis": placement_analysis,
+        "placement_error": placement_error,
         "top_ops": op_counts,
         "inference": inference_summary,
         "artifacts": {
@@ -397,6 +865,7 @@ def main() -> None:
             "graph_json": str(graph_json_path),
             "inputs": str(inputs_path),
             "expected": str(expected_path),
+            "functions": function_artifacts,
             "mil_program": str(mil_path) if (mil_path.exists() and not skip_lower) else None,
             "model": str(saved_model_path) if saved_model_path is not None else None,
             "compiled": str(saved_compiled_path) if saved_compiled_path is not None else None,

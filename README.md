@@ -31,6 +31,19 @@ python scripts/convert_mlx_lm_to_coreml.py \
 
 Outputs are written under `artifacts/<run-name>/`
 
+### Convert + Sample Qwen3-0.6B
+
+```bash
+python scripts/convert_and_sample_qwen3_0_6b.py \
+  --prompt "Write one short sentence about ANE acceleration." \
+  --seq-len 96 \
+  --max-new-tokens 16 \
+  --validate-steps 4
+```
+
+This converts `mlx-community/Qwen3-0.6B-bf16`, samples generated tokens from the compiled
+Core ML model, and validates early decode steps against MLX next-token argmax.
+
 ### Python API
 
 For custom pipelines, you can use the python API directly:

@@ -57,6 +57,25 @@ class LoweringArithmeticAliasesExtendedTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_mil_program(graph)
 
+    def test_exp_and_greaterequal_lower(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (2, 3), "fp32"),
+                TensorSpec("y", (2, 3), "fp32"),
+            ],
+            nodes=[
+                Node("exp", ("x",), "ex"),
+                Node("greaterequal", ("ex", "y"), "ge"),
+            ],
+            outputs=["ex", "ge"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("exp(", text)
+        self.assertIn("greater_equal(", text)
+
 
 if __name__ == "__main__":
     unittest.main()

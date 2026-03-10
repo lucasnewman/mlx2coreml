@@ -59,6 +59,70 @@ class LoweringShapeIndexTransformsTests(unittest.TestCase):
         self.assertIn("gather(", text)
         self.assertIn("gather_along_axis(", text)
 
+    def test_split_and_expanddims_lower(self) -> None:
+        graph = Graph(
+            inputs=[TensorSpec("x", (1, 7, 4), "fp32")],
+            nodes=[
+                Node(
+                    "split",
+                    ("x",),
+                    "x0",
+                    attrs={"split_indices": [2], "axis": 2, "output_index": 0, "num_outputs": 2},
+                ),
+                Node(
+                    "split",
+                    ("x",),
+                    "x1",
+                    attrs={"split_indices": [2], "axis": 2, "output_index": 1, "num_outputs": 2},
+                ),
+                Node("expanddims", ("x0",), "x0e", attrs={"axes": [2]}),
+            ],
+            outputs=["x0", "x1", "x0e"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("split(", text)
+        self.assertIn("expand_dims(", text)
+
+    def test_slice_update_lowers(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (1, 8, 256, 128), "fp16"),
+                TensorSpec("u", (1, 8, 8, 128), "fp16"),
+            ],
+            nodes=[
+                Node(
+                    "slice_update",
+                    ("x", "u"),
+                    "y",
+                    attrs={
+                        "begin": [0, 0, 0, 0],
+                        "end": [1, 8, 8, 128],
+                        "stride": [1, 1, 1, 1],
+                    },
+                ),
+                Node(
+                    "slice",
+                    ("y",),
+                    "view",
+                    attrs={
+                        "begin": [0, 0, 0, 0],
+                        "end": [1, 8, 8, 128],
+                        "stride": [1, 1, 1, 1],
+                    },
+                ),
+            ],
+            outputs=["view"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("slice_update(", text)
+        self.assertIn("slice_by_index(", text)
+
 
 if __name__ == "__main__":
     unittest.main()

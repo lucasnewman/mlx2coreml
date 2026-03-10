@@ -1,6 +1,6 @@
 # Ops Status (MLX -> MIL)
 
-- Supported: **124**
+- Supported: **125**
 - Not yet implemented: **37**
 - Not supported: **7**
 
@@ -111,6 +111,7 @@
 | `sigmoid` | `sigmoid` |
 | `slice` | `slice_by_index` |
 | `slice_by_index` | `slice_by_index` |
+| `slice_update` | `slice_update` |
 | `softmax` | `softmax` |
 | `squeeze` | `squeeze` |
 | `std` | `std` |

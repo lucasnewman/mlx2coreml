@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -9,7 +11,7 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 
-from .ir import Graph, Node, TensorSpec
+from .ir import Graph, Node, StateSpec, TensorSpec
 from .op_registry import ensure_supported, mil_op_for_mlx
 from .passes import normalize_graph
 
@@ -19,6 +21,14 @@ _DTYPE_TO_MIL = {
     "int32": types.int32,
     "int64": types.int64,
     "bool": types.bool,
+}
+
+_DTYPE_TO_NUMPY = {
+    "fp16": np.float16,
+    "fp32": np.float32,
+    "int32": np.int32,
+    "int64": np.int64,
+    "bool": np.bool_,
 }
 
 _CAST_DTYPE_ALIASES = {
@@ -39,12 +49,108 @@ _CAST_DTYPE_ALIASES = {
 }
 
 
+@dataclass(frozen=True)
+class LoweringProfile:
+    name: str
+    linearize_matmul_rank_gt2: bool
+
+
+@dataclass(frozen=True)
+class MultifunctionBinding:
+    model_path: Path
+    source_function: str
+    target_function: str
+
+
+def resolve_lowering_profile(target_profile: str | None = None) -> LoweringProfile:
+    key = str(target_profile or "default").strip().lower()
+    if key in {"default", "ane_ios18"}:
+        return LoweringProfile(name=key, linearize_matmul_rank_gt2=True)
+    if key in {"conservative", "baseline"}:
+        return LoweringProfile(name=key, linearize_matmul_rank_gt2=False)
+    raise ValueError(
+        f"Unsupported target_profile={target_profile!r}. "
+        "Use one of: default, ane_ios18, conservative."
+    )
+
+
+def _metadata_to_string_map(metadata: dict[str, object]) -> dict[str, str]:
+    encoded: dict[str, str] = {}
+    for key, value in metadata.items():
+        if isinstance(value, str):
+            encoded[str(key)] = value
+        else:
+            encoded[str(key)] = json.dumps(value, sort_keys=True)
+    return encoded
+
+
+def save_multifunction_package(
+    *,
+    bindings: list[MultifunctionBinding],
+    destination_path: Path,
+    default_function_name: str,
+    metadata: dict[str, object] | None = None,
+) -> Path:
+    if not bindings:
+        raise ValueError("save_multifunction_package requires at least one function binding.")
+    if not str(default_function_name).strip():
+        raise ValueError("default_function_name must be non-empty.")
+
+    destination_path = Path(destination_path).resolve()
+    descriptor = ct.utils.MultiFunctionDescriptor()
+    for binding in bindings:
+        descriptor.add_function(
+            str(Path(binding.model_path).resolve()),
+            str(binding.source_function),
+            str(binding.target_function),
+        )
+    descriptor.default_function_name = str(default_function_name)
+    ct.utils.save_multifunction(descriptor, str(destination_path))
+
+    if metadata:
+        mlmodel = ct.models.MLModel(str(destination_path), skip_model_load=True)
+        for key, value in _metadata_to_string_map(metadata).items():
+            mlmodel.user_defined_metadata[key] = value
+        tmp_destination = destination_path.with_name(
+            f"{destination_path.stem}.tmp_meta{destination_path.suffix}"
+        )
+        if tmp_destination.exists():
+            shutil.rmtree(tmp_destination)
+        mlmodel.save(str(tmp_destination))
+        if tmp_destination.exists():
+            if destination_path.exists():
+                shutil.rmtree(destination_path)
+            tmp_destination.replace(destination_path)
+
+    return destination_path
+
+
 def _to_tensor_spec(spec: TensorSpec) -> mb.TensorSpec:
     if spec.dtype not in _DTYPE_TO_MIL:
         raise ValueError(f"Unsupported input dtype: {spec.dtype}")
     # Core ML placeholders do not support rank-0 inputs. Lift scalar inputs to shape [1].
     shape = spec.shape if len(spec.shape) > 0 else (1,)
     return mb.TensorSpec(shape=shape, dtype=_DTYPE_TO_MIL[spec.dtype])
+
+
+def _to_state_type(spec: StateSpec) -> ct.StateType:
+    if spec.dtype not in _DTYPE_TO_NUMPY:
+        raise ValueError(f"Unsupported state dtype: {spec.dtype}")
+    # Keep consistent with input placeholder handling.
+    shape = spec.shape if len(spec.shape) > 0 else (1,)
+    wrapped = ct.TensorType(shape=shape, dtype=_DTYPE_TO_NUMPY[spec.dtype])
+    return ct.StateType(wrapped_type=wrapped, name=spec.name)
+
+
+def build_coreml_state_types(state_specs: list[StateSpec]) -> list[ct.StateType]:
+    return [_to_state_type(spec) for spec in state_specs]
+
+
+def _to_state_tensor_spec(spec: StateSpec) -> mb.StateTensorSpec:
+    if spec.dtype not in _DTYPE_TO_MIL:
+        raise ValueError(f"Unsupported state dtype: {spec.dtype}")
+    shape = spec.shape if len(spec.shape) > 0 else (1,)
+    return mb.StateTensorSpec(shape=shape, dtype=_DTYPE_TO_MIL[spec.dtype])
 
 
 def _int_list(value: Iterable[int] | None, name: str, node: Node) -> list[int]:
@@ -63,10 +169,21 @@ def _normalize_cast_dtype(dtype: str) -> str:
 
 
 def _static_shape_list(value: object, name: str, node: Node) -> list[int]:
+    static_shape = _shape_list_if_static(value)
+    shape = getattr(value, "shape", None)
+    if static_shape is None:
+        if shape is None:
+            raise ValueError(f"{node.op} node '{node.output}' requires a tensor input for '{name}'.")
+        raise ValueError(
+            f"{node.op} node '{node.output}' requires static shape for '{name}', got {shape}."
+        )
+    return static_shape
+
+
+def _shape_list_if_static(value: object) -> list[int] | None:
     shape = getattr(value, "shape", None)
     if shape is None:
-        raise ValueError(f"{node.op} node '{node.output}' requires a tensor input for '{name}'.")
-
+        return None
     static_shape: list[int] = []
     for dim in shape:
         if isinstance(dim, int):
@@ -74,10 +191,8 @@ def _static_shape_list(value: object, name: str, node: Node) -> list[int]:
             continue
         try:
             static_shape.append(int(dim))
-        except Exception as exc:  # pragma: no cover - defensive for symbolic dims
-            raise ValueError(
-                f"{node.op} node '{node.output}' requires static shape for '{name}', got {shape}."
-            ) from exc
+        except Exception:
+            return None
     return static_shape
 
 
@@ -202,16 +317,23 @@ def _dtype_name(value: object) -> str:
     return str(dtype).lower()
 
 
-def _maybe_lower_matmul_as_linear(node: Node, x: object, y: object) -> object | None:
+def _maybe_lower_matmul_as_linear(
+    node: Node,
+    x: object,
+    y: object,
+    *,
+    allow_rank_gt2: bool,
+) -> object | None:
     """
-    Prefer MIL `linear` for 2D matmul with compile-time constant RHS weights.
-    This matches common projection patterns (flatten -> matmul -> unflatten).
+    Prefer MIL `linear` for matmul with compile-time constant RHS weights.
+    This matches common projection patterns (flatten -> matmul -> unflatten)
+    and helps ANE placement for projection-heavy blocks.
     """
     x_shape = getattr(x, "shape", None)
     y_shape = getattr(y, "shape", None)
     if x_shape is None or y_shape is None:
         return None
-    if len(x_shape) != 2 or len(y_shape) != 2:
+    if len(x_shape) < 2 or len(y_shape) != 2:
         return None
 
     x_dtype = _dtype_name(x)
@@ -227,9 +349,32 @@ def _maybe_lower_matmul_as_linear(node: Node, x: object, y: object) -> object | 
     if not np.issubdtype(weight_rhs.dtype, np.floating):
         return None
 
-    # matmul(x[m, k], y[k, n]) == linear(x, weight[n, k], bias=None)
+    x_shape_static: list[int] = []
+    try:
+        for dim in x_shape:
+            x_shape_static.append(int(dim))
+    except Exception:  # pragma: no cover - symbolic dims fallback to plain matmul
+        return None
+    if len(x_shape_static) < 2:
+        return None
+    if len(x_shape_static) > 2 and not allow_rank_gt2:
+        return None
+
+    k_dim = int(x_shape_static[-1])
+    if k_dim <= 0 or int(weight_rhs.shape[0]) != k_dim:
+        return None
+
+    # matmul(x[..., k], y[k, n]) == linear(x_2d, weight[n, k], bias=None) with reshape.
     weight = np.ascontiguousarray(weight_rhs.T)
-    return mb.linear(x=x, weight=weight, bias=None, name=node.output)
+    if len(x_shape_static) == 2:
+        return mb.linear(x=x, weight=weight, bias=None, name=node.output)
+
+    rows = _prod_ints(x_shape_static[:-1])
+    cols = int(weight_rhs.shape[1])
+    x_2d = mb.reshape(x=x, shape=[rows, k_dim], name=f"{node.output}_x2d")
+    out_2d = mb.linear(x=x_2d, weight=weight, bias=None, name=f"{node.output}_linear")
+    out_shape = [*x_shape_static[:-1], cols]
+    return mb.reshape(x=out_2d, shape=out_shape, name=node.output)
 
 
 def _nan_to_num_defaults(dtype_name: str) -> tuple[float, float, float] | None:
@@ -660,6 +805,60 @@ def _lower_rope(node: Node, env: dict[str, object]) -> object:
     return out
 
 
+def _build_sdpa_causal_mask(
+    *,
+    q_shape: list[int],
+    k_shape: list[int],
+    node: Node,
+) -> object:
+    target_seq = int(q_shape[-2])
+    source_seq = int(k_shape[-2])
+    if target_seq <= 0 or source_seq <= 0:
+        raise ValueError(
+            f"scaled_dot_product_attention node '{node.output}' requires static positive "
+            f"sequence dims for causal mask, got q={q_shape}, k={k_shape}."
+        )
+    return mb.const(
+        val=np.tril(np.ones((target_seq, source_seq), dtype=np.bool_)),
+        name=f"{node.output}_causal_mask",
+    )
+
+
+def _merge_sdpa_masks(explicit_mask: object, causal_mask: object, node: Node) -> object:
+    mask_dtype = _dtype_name(explicit_mask)
+    if "bool" in mask_dtype:
+        return mb.logical_and(
+            x=explicit_mask,
+            y=causal_mask,
+            name=f"{node.output}_mask_combined",
+        )
+
+    float_dtype = "fp16" if ("fp16" in mask_dtype or "float16" in mask_dtype) else "fp32"
+    if any(token in mask_dtype for token in ("fp16", "float16", "fp32", "float32")):
+        explicit_mask_f = explicit_mask
+        if float_dtype == "fp32" and ("fp16" in mask_dtype or "float16" in mask_dtype):
+            explicit_mask_f = mb.cast(
+                x=explicit_mask,
+                dtype="fp32",
+                name=f"{node.output}_mask_fp",
+            )
+    else:
+        explicit_mask_f = mb.cast(
+            x=explicit_mask,
+            dtype=float_dtype,
+            name=f"{node.output}_mask_fp",
+        )
+
+    causal_f = mb.cast(
+        x=causal_mask,
+        dtype=float_dtype,
+        name=f"{node.output}_causal_fp",
+    )
+    inv_causal = mb.sub(x=1.0, y=causal_f, name=f"{node.output}_causal_inv")
+    causal_add = mb.mul(x=-3e4, y=inv_causal, name=f"{node.output}_causal_add")
+    return mb.add(x=explicit_mask_f, y=causal_add, name=f"{node.output}_mask_combined")
+
+
 def _lower_sdpa(node: Node, env: dict[str, object]) -> object:
     if len(node.inputs) < 3:
         raise ValueError(
@@ -691,17 +890,19 @@ def _lower_sdpa(node: Node, env: dict[str, object]) -> object:
 
     scale_attr = node.attrs.get("scale")
     scale = None if scale_attr is None else float(scale_attr)
-    q_shape = _static_shape_list(q, node.inputs[0], node)
-    k_shape = _static_shape_list(k, node.inputs[1], node)
-    v_shape = _static_shape_list(v, node.inputs[2], node)
-    if q_shape[-1] <= 0:
-        raise ValueError(
-            f"scaled_dot_product_attention node '{node.output}' has invalid query embedding dim {q_shape[-1]}."
-        )
-    default_scale = float(1.0 / np.sqrt(float(q_shape[-1])))
+    q_shape = _shape_list_if_static(q)
+    k_shape = _shape_list_if_static(k)
+    v_shape = _shape_list_if_static(v)
+    default_scale: float | None = None
+    if q_shape is not None:
+        if q_shape[-1] <= 0:
+            raise ValueError(
+                f"scaled_dot_product_attention node '{node.output}' has invalid query embedding dim {q_shape[-1]}."
+            )
+        default_scale = float(1.0 / np.sqrt(float(q_shape[-1])))
 
     # Handle grouped-query attention by repeating key/value heads when needed.
-    if len(q_shape) >= 3 and len(k_shape) >= 3 and len(v_shape) >= 3:
+    if q_shape is not None and k_shape is not None and v_shape is not None and len(q_shape) >= 3 and len(k_shape) >= 3 and len(v_shape) >= 3:
         q_heads = int(q_shape[-3])
         k_heads = int(k_shape[-3])
         v_heads = int(v_shape[-3])
@@ -738,67 +939,60 @@ def _lower_sdpa(node: Node, env: dict[str, object]) -> object:
 
     can_use_fused = hasattr(mb, "scaled_dot_product_attention")
     if can_use_fused:
-        if do_causal and mask is not None:
+        if scale is not None and default_scale is None:
+            # We cannot prove custom scale equals the implicit default when symbolic dims are present.
             can_use_fused = False
-        if scale is not None and not np.isclose(scale, default_scale, rtol=1e-6, atol=1e-8):
+        elif scale is not None and default_scale is not None and not np.isclose(
+            scale, default_scale, rtol=1e-6, atol=1e-8
+        ):
             can_use_fused = False
 
-    if can_use_fused:
-        fused_mask = mask
-        if do_causal:
-            target_seq = int(q_shape[-2])
-            source_seq = int(k_shape[-2])
-            if target_seq <= 0 or source_seq <= 0:
-                raise ValueError(
-                    f"scaled_dot_product_attention node '{node.output}' requires static positive "
-                    f"sequence dims for causal mask, got q={q_shape}, k={k_shape}."
-                )
-            fused_mask = mb.const(
-                val=np.tril(np.ones((target_seq, source_seq), dtype=np.bool_)),
-                name=f"{node.output}_causal_mask",
+    merged_mask = mask
+    if do_causal:
+        if q_shape is None or k_shape is None:
+            raise ValueError(
+                f"scaled_dot_product_attention node '{node.output}' requires static shape for "
+                "causal masking when do_causal=True."
             )
+        causal_mask = _build_sdpa_causal_mask(q_shape=q_shape, k_shape=k_shape, node=node)
+        if merged_mask is None:
+            merged_mask = causal_mask
+        else:
+            merged_mask = _merge_sdpa_masks(merged_mask, causal_mask, node)
+
+    if can_use_fused:
         kwargs: dict[str, object] = {
             "query": q,
             "key": k,
             "value": v,
             "name": node.output,
         }
-        if fused_mask is not None:
-            kwargs["attn_mask"] = fused_mask
+        if merged_mask is not None:
+            kwargs["attn_mask"] = merged_mask
         return mb.scaled_dot_product_attention(**kwargs)
 
     scores = mb.matmul(x=q, y=k, transpose_y=True, name=f"{node.output}_scores")
-    scale_to_use = default_scale if scale is None else float(scale)
+    if scale is None:
+        if default_scale is None:
+            raise ValueError(
+                f"scaled_dot_product_attention node '{node.output}' requires explicit 'scale' "
+                "when query head dimension is symbolic and fused SDPA path is unavailable."
+            )
+        scale_to_use = default_scale
+    else:
+        scale_to_use = float(scale)
     if not np.isclose(scale_to_use, 1.0, rtol=1e-6, atol=1e-8):
         scores = mb.mul(x=scores, y=float(scale_to_use), name=f"{node.output}_scores_scaled")
 
-    if do_causal:
-        if mask is not None:
-            raise ValueError(
-                f"scaled_dot_product_attention node '{node.output}' currently does not support "
-                "combining do_causal=True with an explicit mask in decomposition path."
-            )
-        target_seq = int(q_shape[-2])
-        source_seq = int(k_shape[-2])
-        if target_seq <= 0 or source_seq <= 0:
-            raise ValueError(
-                f"scaled_dot_product_attention node '{node.output}' requires static positive "
-                f"sequence dims for causal mask, got q={q_shape}, k={k_shape}."
-            )
-        mask = mb.const(
-            val=np.tril(np.ones((target_seq, source_seq), dtype=np.bool_)),
-            name=f"{node.output}_causal_mask",
-        )
-
-    if mask is not None:
-        mask_dtype = _dtype_name(mask)
+    if merged_mask is not None:
+        mask_dtype = _dtype_name(merged_mask)
         if "bool" in mask_dtype:
-            mask_f = mb.cast(x=mask, dtype="fp32", name=f"{node.output}_mask_fp")
+            mask_f = mb.cast(x=merged_mask, dtype="fp32", name=f"{node.output}_mask_fp")
             inv_mask = mb.sub(x=1.0, y=mask_f, name=f"{node.output}_mask_inv")
             additive_mask = mb.mul(x=-3e4, y=inv_mask, name=f"{node.output}_mask_add")
             scores = mb.add(x=scores, y=additive_mask, name=f"{node.output}_scores_masked")
         else:
-            scores = mb.add(x=scores, y=mask, name=f"{node.output}_scores_masked")
+            scores = mb.add(x=scores, y=merged_mask, name=f"{node.output}_scores_masked")
 
     weights = mb.softmax(x=scores, axis=-1, name=f"{node.output}_weights")
     return mb.matmul(x=weights, y=v, name=node.output)
@@ -950,6 +1144,47 @@ def _lower_conv_op(node: Node, env: dict[str, object], transpose: bool) -> objec
         )
     pad = _parse_conv_pad(raw_pad, num_spatial_dims, node)
 
+    # MLX callback capture frequently emits 1-D depthwise Convolution in channels-last form:
+    # x: [N, L, C], weight: [C, K, 1]. Convert to Core ML's channels-first conv and transpose back.
+    x_shape_static = _shape_list_if_static(x)
+    w_shape_static = _shape_list_if_static(weight)
+    if (
+        not transpose
+        and num_spatial_dims == 1
+        and x_shape_static is not None
+        and w_shape_static is not None
+        and len(x_shape_static) == 3
+        and len(w_shape_static) == 3
+    ):
+        channels = int(x_shape_static[-1])
+        if (
+            int(w_shape_static[0]) == channels
+            and int(w_shape_static[2]) == 1
+            and (groups == 1 or groups == channels)
+        ):
+            groups = channels
+            x_ncl = mb.transpose(x=x, perm=[0, 2, 1], name=f"{node.output}_x_ncl")
+
+            weight_val = getattr(weight, "val", None)
+            if weight_val is not None:
+                w_oik = np.transpose(np.asarray(weight_val), (0, 2, 1))
+                weight_ncl = mb.const(val=w_oik, name=f"{node.output}_w_oik")
+            else:
+                weight_ncl = mb.transpose(x=weight, perm=[0, 2, 1], name=f"{node.output}_w_oik")
+
+            conv_ncl = mb.conv(
+                x=x_ncl,
+                weight=weight_ncl,
+                bias=bias,
+                strides=strides,
+                pad_type=pad_type,
+                pad=pad,
+                dilations=dilations,
+                groups=groups,
+                name=f"{node.output}_ncl",
+            )
+            return mb.transpose(x=conv_ncl, perm=[0, 2, 1], name=node.output)
+
     if transpose:
         output_shape = _parse_conv_output_shape(
             node.attrs.get("output_shape"),
@@ -991,7 +1226,11 @@ def _lower_conv_op(node: Node, env: dict[str, object], transpose: bool) -> objec
     )
 
 
-def _lower_node(node: Node, env: dict[str, object]) -> object:
+def _lower_node(
+    node: Node,
+    env: dict[str, object],
+    profile: LoweringProfile,
+) -> object:
     mil_op = mil_op_for_mlx(node.op)
     if mil_op is None:
         raise ValueError(f"Unsupported op while lowering: {node.op}")
@@ -1001,10 +1240,45 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
             raise ValueError(f"constant node '{node.output}' requires 'value' attr.")
         return mb.const(val=node.attrs["value"], name=node.output)
 
+    if mil_op == "read_state":
+        if len(node.inputs) != 1:
+            raise ValueError(f"read_state node '{node.output}' requires exactly 1 state input.")
+        return mb.read_state(input=env[node.inputs[0]], name=node.output)
+    if mil_op == "coreml_update_state":
+        if len(node.inputs) != 2:
+            raise ValueError(
+                f"write_state node '{node.output}' requires exactly 2 inputs (state, value)."
+            )
+        return mb.coreml_update_state(
+            state=env[node.inputs[0]],
+            value=env[node.inputs[1]],
+            name=node.output,
+        )
+    if mil_op == "state_update_masked":
+        if len(node.inputs) != 3:
+            raise ValueError(
+                f"state_update_masked node '{node.output}' requires 3 inputs (state, value, mask)."
+            )
+        state = env[node.inputs[0]]
+        value = env[node.inputs[1]]
+        mask = env[node.inputs[2]]
+        current = mb.read_state(input=state, name=f"{node.output}_current")
+        mask_dtype = _dtype_name(mask)
+        mask_bool = mask if "bool" in mask_dtype else mb.cast(
+            x=mask, dtype="bool", name=f"{node.output}_mask_bool"
+        )
+        merged = mb.select(cond=mask_bool, a=value, b=current, name=f"{node.output}_merged")
+        return mb.coreml_update_state(state=state, value=merged, name=node.output)
+
     if mil_op == "matmul":
         x = env[node.inputs[0]]
         y = env[node.inputs[1]]
-        linear = _maybe_lower_matmul_as_linear(node, x, y)
+        linear = _maybe_lower_matmul_as_linear(
+            node,
+            x,
+            y,
+            allow_rank_gt2=profile.linearize_matmul_rank_gt2,
+        )
         if linear is not None:
             return linear
         return mb.matmul(x=x, y=y, name=node.output)
@@ -1058,6 +1332,8 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
         return mb.identity(x=out, name=node.output)
     if mil_op == "greater":
         return mb.greater(x=env[node.inputs[0]], y=env[node.inputs[1]], name=node.output)
+    if mil_op == "greater_equal":
+        return mb.greater_equal(x=env[node.inputs[0]], y=env[node.inputs[1]], name=node.output)
     if mil_op == "less":
         return mb.less(x=env[node.inputs[0]], y=env[node.inputs[1]], name=node.output)
     if mil_op == "bitwisebinary":
@@ -1071,6 +1347,32 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
         raise ValueError(
             f"bitwisebinary node '{node.output}' has unsupported mode={mode}. "
             "Supported modes: 0 (and), 1 (or)."
+        )
+    if mil_op == "reduce":
+        if len(node.inputs) != 1:
+            raise ValueError(f"reduce node '{node.output}' requires exactly 1 input.")
+        mode = int(node.attrs.get("mode", 2))
+        x = env[node.inputs[0]]
+        rank = len(x.shape)
+        axes = _parse_reduction_axes(node, rank)
+        keep_dims = bool(node.attrs.get("keep_dims", True))
+        if mode == 0:
+            mask = _as_bool_tensor(x, node.output)
+            return _reduce_bool_mask(mask, axes, keep_dims, any_mode=False, name=node.output)
+        if mode == 1:
+            mask = _as_bool_tensor(x, node.output)
+            return _reduce_bool_mask(mask, axes, keep_dims, any_mode=True, name=node.output)
+        if mode == 2:
+            return mb.reduce_sum(x=x, axes=axes, keep_dims=keep_dims, name=node.output)
+        if mode == 3:
+            return mb.reduce_prod(x=x, axes=axes, keep_dims=keep_dims, name=node.output)
+        if mode == 4:
+            return mb.reduce_min(x=x, axes=axes, keep_dims=keep_dims, name=node.output)
+        if mode == 5:
+            return mb.reduce_max(x=x, axes=axes, keep_dims=keep_dims, name=node.output)
+        raise ValueError(
+            f"reduce node '{node.output}' has unsupported mode={mode}. "
+            "Supported modes: 0 (all), 1 (any), 2 (sum), 3 (prod), 4 (min), 5 (max)."
         )
     if mil_op in {
         "reduce_sum",
@@ -1120,6 +1422,21 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
     if mil_op == "transpose":
         perm = _int_list(node.attrs.get("perm"), "perm", node)
         return mb.transpose(x=env[node.inputs[0]], perm=perm, name=node.output)
+    if mil_op == "expand_dims":
+        if len(node.inputs) != 1:
+            raise ValueError(f"expand_dims node '{node.output}' requires exactly 1 input.")
+        axes_raw = node.attrs.get("axes", node.attrs.get("axis"))
+        if axes_raw is None:
+            raise ValueError(f"expand_dims node '{node.output}' requires 'axes' (or 'axis') attr.")
+        if isinstance(axes_raw, int):
+            axes = [int(axes_raw)]
+        elif isinstance(axes_raw, (list, tuple)):
+            axes = [int(v) for v in axes_raw]
+        else:
+            raise ValueError(
+                f"expand_dims node '{node.output}' expects axes as int/list, got {axes_raw!r}."
+            )
+        return mb.expand_dims(x=env[node.inputs[0]], axes=axes, name=node.output)
     if mil_op == "atleast_1d":
         x = env[node.inputs[0]]
         if len(x.shape) >= 1:
@@ -1186,6 +1503,115 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
             stride=stride,
             name=node.output,
         )
+    if mil_op == "slice_update":
+        if len(node.inputs) != 2:
+            raise ValueError(
+                f"slice_update node '{node.output}' requires exactly 2 inputs (x, update)."
+            )
+        begin = _int_list(node.attrs.get("begin"), "begin", node)
+        end = _int_list(node.attrs.get("end"), "end", node)
+        stride = node.attrs.get("stride")
+        if stride is not None:
+            stride = [int(v) for v in stride]
+
+        begin_mask = node.attrs.get("begin_mask")
+        if begin_mask is not None:
+            begin_mask = [bool(v) for v in begin_mask]
+        end_mask = node.attrs.get("end_mask")
+        if end_mask is not None:
+            end_mask = [bool(v) for v in end_mask]
+        squeeze_mask = node.attrs.get("squeeze_mask")
+        if squeeze_mask is not None:
+            squeeze_mask = [bool(v) for v in squeeze_mask]
+
+        return mb.slice_update(
+            x=env[node.inputs[0]],
+            update=env[node.inputs[1]],
+            begin=begin,
+            end=end,
+            stride=stride,
+            begin_mask=begin_mask,
+            end_mask=end_mask,
+            squeeze_mask=squeeze_mask,
+            name=node.output,
+        )
+    if mil_op == "split":
+        if len(node.inputs) != 1:
+            raise ValueError(f"split node '{node.output}' requires exactly 1 input.")
+        x = env[node.inputs[0]]
+        rank = len(x.shape)
+        axis = int(node.attrs.get("axis", 0))
+        axis = _normalize_axes(rank, [axis], "axis", node)[0]
+        output_index = int(node.attrs.get("output_index", 0))
+
+        def _parse_split_sizes() -> list[int] | None:
+            explicit = node.attrs.get("split_sizes")
+            if isinstance(explicit, (list, tuple)):
+                parsed = [int(v) for v in explicit]
+                if any(v < 0 for v in parsed):
+                    raise ValueError(
+                        f"split node '{node.output}' requires non-negative split_sizes, got {parsed}."
+                    )
+                return parsed
+            return None
+
+        split_sizes = _parse_split_sizes()
+        num_splits_attr = node.attrs.get("num_splits", node.attrs.get("num_outputs"))
+        num_splits = int(num_splits_attr) if num_splits_attr is not None else None
+        if num_splits is not None and num_splits <= 0:
+            raise ValueError(f"split node '{node.output}' requires num_splits > 0, got {num_splits}.")
+
+        if split_sizes is None:
+            split_indices = node.attrs.get("split_indices")
+            if isinstance(split_indices, (list, tuple)):
+                x_shape_static = _shape_list_if_static(x)
+                if x_shape_static is None:
+                    raise ValueError(
+                        f"split node '{node.output}' requires static input shape when using split_indices."
+                    )
+                axis_dim = int(x_shape_static[axis])
+                indices = [int(v) for v in split_indices]
+                prev = 0
+                split_sizes = []
+                for idx in indices:
+                    if idx < prev or idx > axis_dim:
+                        raise ValueError(
+                            f"split node '{node.output}' has invalid split index {idx} for axis size {axis_dim}."
+                        )
+                    split_sizes.append(idx - prev)
+                    prev = idx
+                split_sizes.append(axis_dim - prev)
+
+        if split_sizes is not None:
+            if output_index < 0 or output_index >= len(split_sizes):
+                raise ValueError(
+                    f"split node '{node.output}' output_index={output_index} is out of range "
+                    f"for {len(split_sizes)} split outputs."
+                )
+            splits = mb.split(
+                x=x,
+                split_sizes=split_sizes,
+                axis=axis,
+                name=f"{node.output}_split",
+            )
+            return mb.identity(x=splits[output_index], name=node.output)
+
+        if num_splits is None:
+            raise ValueError(
+                f"split node '{node.output}' requires split_sizes/split_indices/num_splits attrs."
+            )
+        if output_index < 0 or output_index >= num_splits:
+            raise ValueError(
+                f"split node '{node.output}' output_index={output_index} is out of range "
+                f"for {num_splits} split outputs."
+            )
+        splits = mb.split(
+            x=x,
+            num_splits=num_splits,
+            axis=axis,
+            name=f"{node.output}_split",
+        )
+        return mb.identity(x=splits[output_index], name=node.output)
     if mil_op == "gather":
         axis = int(node.attrs.get("axis", 0))
         gathered = mb.gather(
@@ -1221,6 +1647,9 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
         axis = int(node.attrs.get("axis", 0))
         return mb.concat(values=[env[name] for name in node.inputs], axis=axis, name=node.output)
     if mil_op in {"zeros", "ones", "full"}:
+        if mil_op == "full" and len(node.inputs) == 1 and "shape" not in node.attrs and "value" not in node.attrs:
+            # MLX callback export can emit Full as a materialization op on a pre-broadcast tensor.
+            return mb.identity(x=env[node.inputs[0]], name=node.output)
         shape = _int_list(node.attrs.get("shape"), "shape", node)
         if mil_op == "zeros":
             value = float(node.attrs.get("value", 0.0))
@@ -1309,6 +1738,9 @@ def _lower_node(node: Node, env: dict[str, object]) -> object:
         x = _coerce_float_tensor(env[node.inputs[0]], node.output)
         ex = mb.exp(x=x, name=f"{node.output}_exp")
         return mb.sub(x=ex, y=1.0, name=node.output)
+    if mil_op == "exp":
+        x = _coerce_float_tensor(env[node.inputs[0]], node.output)
+        return mb.exp(x=x, name=node.output)
     if mil_op == "log1p":
         x = _float_log_tensor(env[node.inputs[0]], node.output)
         return mb.log(x=mb.add(x=x, y=1.0, name=f"{node.output}_plus1"), name=node.output)
@@ -1799,22 +2231,91 @@ def build_mil_program(
     graph: Graph,
     deployment_target: ct.target = ct.target.iOS18,
     normalize: bool = True,
+    target_profile: str | None = "default",
+    shared_state_specs: list[StateSpec] | None = None,
 ):
-    graph.validate()
-    working_graph = normalize_graph(graph) if normalize else graph
-    ensure_supported(working_graph)
-    input_specs = {spec.name: _to_tensor_spec(spec) for spec in working_graph.inputs}
+    return build_mil_program_from_graphs(
+        {"main": graph},
+        deployment_target=deployment_target,
+        normalize=normalize,
+        target_profile=target_profile,
+        shared_input_specs=list(graph.inputs),
+        shared_state_specs=shared_state_specs,
+    )
+
+
+def build_mil_program_from_graphs(
+    function_graphs: dict[str, Graph],
+    deployment_target: ct.target = ct.target.iOS18,
+    normalize: bool = True,
+    target_profile: str | None = "default",
+    shared_input_specs: list[TensorSpec] | None = None,
+    shared_state_specs: list[StateSpec] | None = None,
+):
+    if not function_graphs:
+        raise ValueError("build_mil_program_from_graphs requires at least one function graph.")
+
+    profile = resolve_lowering_profile(target_profile)
     program = Program()
+    expected_inputs: dict[str, tuple[tuple[int, ...], str]] | None = None
+    state_spec_by_name: dict[str, StateSpec] = {}
+    state_names: set[str] = set()
+    if shared_input_specs is not None:
+        expected_inputs = {}
+        for spec in shared_input_specs:
+            if spec.name in expected_inputs:
+                raise ValueError(f"Duplicate shared input spec name: {spec.name}")
+            expected_inputs[spec.name] = (tuple(int(v) for v in spec.shape), str(spec.dtype))
+    if shared_state_specs is not None:
+        seen_state_names: set[str] = set()
+        for spec in shared_state_specs:
+            if spec.name in seen_state_names:
+                raise ValueError(f"Duplicate shared state spec name: {spec.name}")
+            seen_state_names.add(spec.name)
+            state_spec_by_name[spec.name] = spec
+        state_names = seen_state_names
 
-    with Function(input_specs, opset_version=deployment_target) as func:
-        env = dict(func.inputs)
-        for node in working_graph.nodes:
-            env[node.output] = _lower_node(node, env)
+    for function_name, graph in function_graphs.items():
+        if not str(function_name).strip():
+            raise ValueError("Function name cannot be empty.")
+        graph.validate()
+        working_graph = normalize_graph(graph) if normalize else graph
+        ensure_supported(working_graph)
+        graph_input_specs = {
+            spec.name: (tuple(int(v) for v in spec.shape), str(spec.dtype))
+            for spec in working_graph.inputs
+        }
+        filtered_graph_inputs = {
+            name: spec for name, spec in graph_input_specs.items() if name not in state_names
+        }
+        filtered_expected_inputs = (
+            {name: spec for name, spec in expected_inputs.items() if name not in state_names}
+            if expected_inputs is not None
+            else None
+        )
+        if filtered_expected_inputs is not None and filtered_graph_inputs != filtered_expected_inputs:
+            raise ValueError(
+                f"Function '{function_name}' inputs do not match shared_input_specs. "
+                f"Expected {sorted(filtered_expected_inputs.items())}, got {sorted(filtered_graph_inputs.items())}."
+            )
+        input_list = shared_input_specs if shared_input_specs is not None else working_graph.inputs
+        input_specs = {
+            spec.name: _to_tensor_spec(spec)
+            for spec in input_list
+            if spec.name not in state_names
+        }
+        for state_name in state_names:
+            state_spec = state_spec_by_name[state_name]
+            input_specs[state_name] = _to_state_tensor_spec(state_spec)
 
-        outputs = [env[name] for name in working_graph.outputs]
-        func.set_outputs(outputs)
-        program.add_function("main", func)
+        with Function(input_specs, opset_version=deployment_target) as func:
+            env = dict(func.inputs)
+            for node in working_graph.nodes:
+                env[node.output] = _lower_node(node, env, profile)
 
+            outputs = [env[name] for name in working_graph.outputs]
+            func.set_outputs(outputs)
+            program.add_function(str(function_name), func)
     return program
 
 
@@ -1840,6 +2341,9 @@ def convert_program_to_model(
     convert_to: str = "mlprogram",
     compute_precision: str | None = None,
     compute_units: str | None = None,
+    inputs: list[object] | None = None,
+    state_specs: list[StateSpec] | None = None,
+    states: list[object] | None = None,
 ):
     kwargs: dict[str, object] = {
         "convert_to": convert_to,
@@ -1860,7 +2364,24 @@ def convert_program_to_model(
             )
     if compute_units is not None:
         kwargs["compute_units"] = _parse_compute_units(compute_units)
-    return ct.convert(program, **kwargs)
+    if inputs is not None:
+        kwargs["inputs"] = inputs
+    if states is not None and state_specs is not None:
+        raise ValueError("Provide either 'states' or 'state_specs', not both.")
+    if state_specs is not None:
+        kwargs["states"] = build_coreml_state_types(state_specs)
+    elif states is not None:
+        kwargs["states"] = states
+    try:
+        return ct.convert(program, **kwargs)
+    except ValueError as exc:
+        # ct.convert(program=Program, states=...) is rejected by some coremltools versions.
+        # Stateful MIL programs already encode state placeholders via StateTensorSpec.
+        if "states" in kwargs and "can only be passed with pytorch source model" in str(exc):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("states", None)
+            return ct.convert(program, **retry_kwargs)
+        raise
 
 
 def compile_model_artifact(model_path: Path, compiled_path: Path | None = None) -> Path:

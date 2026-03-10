@@ -13,7 +13,7 @@ from .op_registry import mil_op_for_mlx, normalize_mlx_op_name
 _IDENTITY_OPS = {"identity", "stop_gradient", "copy", "contiguous"}
 _CONSTANT_OPS = {"const", "constant", "literal"}
 _SAFE_NAME_RE = re.compile(r"[^0-9a-zA-Z_]")
-_MAX_INLINE_ARRAY_VALUES = 4096
+_MAX_INLINE_ARRAY_VALUES = 128
 _INPUT_DTYPE_ALIASES: dict[str, str] = {
     "fp16": "fp16",
     "float16": "fp16",
@@ -214,6 +214,63 @@ def eliminate_identity_noops(graph: Graph) -> Graph:
     return normalized
 
 
+def canonicalize_sdpa_masks(graph: Graph) -> Graph:
+    nodes: list[Node] = []
+    for node in graph.nodes:
+        mil_op = mil_op_for_mlx(node.op)
+        if mil_op != "scaled_dot_product_attention":
+            nodes.append(
+                Node(
+                    op=node.op,
+                    inputs=node.inputs,
+                    output=node.output,
+                    attrs=dict(node.attrs),
+                    source=node.source,
+                )
+            )
+            continue
+
+        attrs = dict(node.attrs)
+        attrs["do_causal"] = bool(attrs.get("do_causal", False))
+        attrs["has_sinks"] = bool(attrs.get("has_sinks", False))
+        attrs["output_logsumexp"] = bool(attrs.get("output_logsumexp", False))
+        if "output_index" in attrs:
+            try:
+                attrs["output_index"] = int(attrs["output_index"])
+            except Exception:
+                attrs["output_index"] = attrs["output_index"]
+        if attrs.get("scale") is not None:
+            try:
+                attrs["scale"] = float(attrs["scale"])
+            except Exception:
+                pass
+
+        if len(node.inputs) < 4:
+            attrs["mask_mode"] = "none"
+        else:
+            mask_mode_raw = str(attrs.get("mask_mode", "auto")).strip().lower()
+            if mask_mode_raw not in {"auto", "bool", "additive"}:
+                mask_mode_raw = "auto"
+            if attrs["do_causal"] and mask_mode_raw == "auto":
+                attrs["mask_mode"] = "causal_plus_explicit"
+            else:
+                attrs["mask_mode"] = mask_mode_raw
+
+        nodes.append(
+            Node(
+                op=node.op,
+                inputs=node.inputs,
+                output=node.output,
+                attrs=attrs,
+                source=node.source,
+            )
+        )
+
+    normalized = Graph(inputs=list(graph.inputs), nodes=nodes, outputs=list(graph.outputs))
+    normalized.validate()
+    return normalized
+
+
 def _promote_dtype(lhs: str | None, rhs: str | None) -> str | None:
     if lhs is None:
         return rhs
@@ -360,6 +417,16 @@ def _infer_node_spec(node: Node, input_specs: list[InferredTensorSpec]) -> Infer
             out_shape = tuple(list(q_shape[:-1]) + [v_shape[-1]])
         return InferredTensorSpec(shape=out_shape, dtype=input_specs[0].dtype)
 
+    if mil_op == "reduce":
+        src = input_specs[0] if input_specs else InferredTensorSpec(shape=None, dtype=None)
+        keep_dims = bool(node.attrs.get("keep_dims", True))
+        mode = int(node.attrs.get("mode", 2))
+        out_dtype = "bool" if mode in {0, 1} else src.dtype
+        return InferredTensorSpec(
+            shape=_reduced_shape(src.shape, node.attrs.get("axes"), keep_dims),
+            dtype=out_dtype,
+        )
+
     if mil_op in {"reduce_sum", "reduce_mean", "reduce_min", "reduce_max", "reduce_prod", "reduce_log_sum_exp"}:
         src = input_specs[0] if input_specs else InferredTensorSpec(shape=None, dtype=None)
         keep_dims = bool(node.attrs.get("keep_dims", False))
@@ -415,6 +482,35 @@ def _infer_node_spec(node: Node, input_specs: list[InferredTensorSpec]) -> Infer
             out_shape = None
         return InferredTensorSpec(shape=out_shape, dtype=src.dtype)
 
+    if mil_op == "expand_dims" and input_specs:
+        src = input_specs[0]
+        if src.shape is None:
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+        axes_raw = node.attrs.get("axes", node.attrs.get("axis"))
+        if isinstance(axes_raw, int):
+            axes = [int(axes_raw)]
+        elif isinstance(axes_raw, (list, tuple)):
+            axes = [int(v) for v in axes_raw]
+        else:
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+        if not axes:
+            return InferredTensorSpec(shape=src.shape, dtype=src.dtype)
+        rank = len(src.shape)
+        # Normalize against output rank as expand_dims allows insertion at rank and below.
+        out_rank = rank + len(axes)
+        norm_axes: list[int] = []
+        for axis in axes:
+            a = axis + out_rank if axis < 0 else axis
+            if a < 0 or a >= out_rank:
+                return InferredTensorSpec(shape=None, dtype=src.dtype)
+            norm_axes.append(a)
+        if len(set(norm_axes)) != len(norm_axes):
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+        out_shape = list(src.shape)
+        for axis in sorted(norm_axes):
+            out_shape.insert(axis, 1)
+        return InferredTensorSpec(shape=tuple(out_shape), dtype=src.dtype)
+
     if mil_op == "concat":
         if not input_specs:
             return InferredTensorSpec(shape=None, dtype=None)
@@ -439,6 +535,48 @@ def _infer_node_spec(node: Node, input_specs: list[InferredTensorSpec]) -> Infer
             total += shape[axis]
         shape0[axis] = total
         return InferredTensorSpec(shape=tuple(shape0), dtype=dtype)
+
+    if mil_op == "split" and input_specs:
+        src = input_specs[0]
+        if src.shape is None:
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+        axis = int(node.attrs.get("axis", 0))
+        rank = len(src.shape)
+        axis = axis + rank if axis < 0 else axis
+        if axis < 0 or axis >= rank:
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+
+        axis_dim = int(src.shape[axis])
+        output_index = int(node.attrs.get("output_index", 0))
+        split_sizes = node.attrs.get("split_sizes")
+        sizes: list[int] | None = None
+        if isinstance(split_sizes, (list, tuple)):
+            sizes = [int(v) for v in split_sizes]
+        else:
+            split_indices = node.attrs.get("split_indices")
+            if isinstance(split_indices, (list, tuple)):
+                indices = [int(v) for v in split_indices]
+                prev = 0
+                sizes = []
+                for idx in indices:
+                    if idx < prev or idx > axis_dim:
+                        return InferredTensorSpec(shape=None, dtype=src.dtype)
+                    sizes.append(idx - prev)
+                    prev = idx
+                sizes.append(axis_dim - prev)
+            else:
+                num_splits_raw = node.attrs.get("num_splits", node.attrs.get("num_outputs"))
+                if num_splits_raw is not None:
+                    num_splits = int(num_splits_raw)
+                    if num_splits <= 0 or axis_dim % num_splits != 0:
+                        return InferredTensorSpec(shape=None, dtype=src.dtype)
+                    sizes = [axis_dim // num_splits] * num_splits
+
+        if sizes is None or output_index < 0 or output_index >= len(sizes):
+            return InferredTensorSpec(shape=None, dtype=src.dtype)
+        out_shape = list(src.shape)
+        out_shape[axis] = int(sizes[output_index])
+        return InferredTensorSpec(shape=tuple(out_shape), dtype=src.dtype)
 
     if mil_op == "cast":
         dtype = node.attrs.get("dtype")
@@ -515,7 +653,7 @@ def _infer_node_spec(node: Node, input_specs: list[InferredTensorSpec]) -> Infer
         dtype = src.dtype
         return InferredTensorSpec(shape=None, dtype=dtype)
 
-    if mil_op in {"sigmoid", "softmax"} and input_specs:
+    if mil_op in {"sigmoid", "softmax", "exp"} and input_specs:
         return InferredTensorSpec(shape=input_specs[0].shape, dtype=input_specs[0].dtype)
 
     if mil_op == "rmsnorm" and input_specs:
@@ -556,5 +694,6 @@ def normalize_graph(graph: Graph) -> Graph:
     canonical = canonicalize_input_specs(canonical)
     canonical = canonicalize_tensor_names(canonical)
     canonical = canonicalize_constant_attrs(canonical)
+    canonical = canonicalize_sdpa_masks(canonical)
     canonical = eliminate_identity_noops(canonical)
     return canonical

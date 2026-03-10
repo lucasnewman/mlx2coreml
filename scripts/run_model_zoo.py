@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from mlx2coreml.compute_plan import analyze_compiled_model_placement  # noqa: E402
 from mlx2coreml.lower_to_mil import (  # noqa: E402
     build_mil_program,
     compile_model_artifact,
@@ -26,7 +27,13 @@ from tests.model_zoo import (  # noqa: E402
 )
 from mlx2coreml.op_registry import UnsupportedOpsError, ensure_supported, unsupported_op_details  # noqa: E402
 from mlx2coreml.passes import infer_graph_specs, normalize_graph, summarize_inference  # noqa: E402
-from mlx2coreml.reporting import build_run_context, write_json  # noqa: E402
+from mlx2coreml.reporting import (  # noqa: E402
+    build_run_context,
+    init_stage_timings,
+    summarize_stage_timings,
+    timed_stage,
+    write_json,
+)
 
 
 def parse_deployment_target(target_name: str):
@@ -74,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         help="Core ML minimum deployment target (for example: iOS18).",
     )
     parser.add_argument(
+        "--target-profile",
+        default="default",
+        choices=["default", "ane_ios18", "conservative"],
+        help="Lowering profile used to control rewrite aggressiveness.",
+    )
+    parser.add_argument(
         "--convert-to",
         default="mlprogram",
         choices=["mlprogram", "neuralnetwork"],
@@ -111,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         "--fail-fast",
         action="store_true",
         help="Stop immediately when one model fails.",
+    )
+    parser.add_argument(
+        "--analyze-placement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Analyze ANE/GPU/CPU placement from compiled models using compute plans.",
     )
     return parser.parse_args()
 
@@ -204,9 +223,15 @@ def _build_model_report(
     seed: int,
     graph_ops: list[str],
     stage_status: dict[str, str],
+    stage_durations_sec: dict[str, float | None],
+    total_duration_sec: float,
     model_path: Path,
     capture_dot_path: Path | None,
     compiled_path: Path | None,
+    fallback_op_count: int | None,
+    top_fallback_ops: list[list[Any]],
+    placement_analysis: dict[str, Any] | None,
+    placement_error: str | None,
     parity_stats: dict[str, dict[str, float | str]] | None,
     inference_summary: dict[str, int] | None,
     unsupported_details: list[dict[str, Any]] | None = None,
@@ -222,7 +247,13 @@ def _build_model_report(
         "seed": int(seed),
         "ops": list(graph_ops),
         "stage_status": dict(stage_status),
+        "stage_durations_sec": dict(stage_durations_sec),
+        "total_duration_sec": float(total_duration_sec),
         "status": "ok" if error is None else "failed",
+        "fallback_op_count": fallback_op_count,
+        "top_fallback_ops": top_fallback_ops,
+        "placement_analysis": placement_analysis,
+        "placement_error": placement_error,
         "artifacts": {
             "capture_dot": str(capture_dot_path) if capture_dot_path else None,
             "model": str(model_path),
@@ -247,9 +278,13 @@ def _write_model_report_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- Capture mode: `{report['run_context']['capture_mode']}`",
         f"- Ops: `{', '.join(report['ops'])}`",
         f"- Stage status: `{json.dumps(report['stage_status'], sort_keys=True)}`",
+        f"- Stage durations (sec): `{json.dumps(report['stage_durations_sec'], sort_keys=True)}`",
+        f"- Total stage duration (sec): `{report['total_duration_sec']}`",
         f"- Status: `{report['status']}`",
         f"- Deployment target: `{report['run_context']['deployment_target']}`",
+        f"- Target profile: `{report['run_context']['target_profile']}`",
         f"- Conversion backend: `{report['run_context']['convert_to']}`",
+        f"- Fallback ops: `{report['fallback_op_count']}`",
         "- Versions:",
         f"  - python: `{report['run_context']['versions']['python']}`",
         f"  - coremltools: `{report['run_context']['versions']['coremltools']}`",
@@ -269,6 +304,13 @@ def _write_model_report_markdown(path: Path, report: dict[str, Any]) -> None:
     ]
     if report.get("capture_note"):
         lines.append(f"- Capture note: `{report['capture_note']}`")
+    if report["top_fallback_ops"]:
+        lines.append(
+            "- Top fallback ops: "
+            + ", ".join(f"`{name}` x{count}" for name, count in report["top_fallback_ops"])
+        )
+    if report.get("placement_error"):
+        lines.append(f"- Placement analysis error: `{report['placement_error']}`")
     if report.get("inference") is not None:
         lines.append(
             "- Inference coverage: "
@@ -316,8 +358,10 @@ def main() -> None:
         seed=args.seed,
     )
     run_context["capture_mode"] = args.capture_mode
+    run_context["target_profile"] = args.target_profile
     run_context["model_count"] = len(selected_models)
     run_context["models"] = list(selected_models)
+    run_context["analyze_placement"] = bool(args.analyze_placement)
     write_json(artifacts_root / "run_context.json", run_context)
 
     summary: list[dict[str, object]] = []
@@ -334,8 +378,12 @@ def main() -> None:
             "lower": "pending",
             "convert": "pending",
             "compile": "pending" if not args.skip_compile else "skipped",
+            "placement_analysis": (
+                "pending" if (not args.skip_compile and bool(args.analyze_placement)) else "skipped"
+            ),
             "eval": "pending" if (not args.skip_compile and args.eval_compiled) else "skipped",
         }
+        stage_timings = init_stage_timings(stage_status.keys())
         error_message: str | None = None
         unsupported: list[dict[str, Any]] | None = None
         capture_note: str | None = None
@@ -345,51 +393,56 @@ def main() -> None:
         compiled_path: Path | None = None
         capture_dot_path: Path | None = None
         parity_stats: dict[str, dict[str, float | str]] | None = None
+        placement_analysis: dict[str, Any] | None = None
+        placement_error: str | None = None
         inference_summary: dict[str, int] | None = None
 
         try:
-            if args.capture_mode == "static":
-                spec = get_model_spec(model_name, seed=model_seed)
-                stage_status["capture"] = "mock"
-            elif args.capture_mode == "live":
-                if not supports_live_capture(model_name):
-                    stage_status["capture"] = "failed"
-                    raise RuntimeError(
-                        f"Live capture is not implemented for '{model_name}'. "
-                        "Use --capture-mode static/auto or implement capture hook."
-                    )
-                spec = capture_model_spec(
-                    model_name,
-                    seed=model_seed,
-                    artifacts_dir=model_dir,
-                    write_debug_dot=True,
-                )
-                maybe_dot = model_dir / "capture_graph.dot"
-                capture_dot_path = maybe_dot if maybe_dot.exists() else None
-                stage_status["capture"] = "ok"
-            else:  # auto
-                if supports_live_capture(model_name):
-                    try:
-                        spec = capture_model_spec(
-                            model_name,
-                            seed=model_seed,
-                            artifacts_dir=model_dir,
-                            write_debug_dot=True,
+            with timed_stage(stage_timings, "capture"):
+                if args.capture_mode == "static":
+                    spec = get_model_spec(model_name, seed=model_seed)
+                    stage_status["capture"] = "mock"
+                elif args.capture_mode == "live":
+                    if not supports_live_capture(model_name):
+                        stage_status["capture"] = "failed"
+                        raise RuntimeError(
+                            f"Live capture is not implemented for '{model_name}'. "
+                            "Use --capture-mode static/auto or implement capture hook."
                         )
-                        maybe_dot = model_dir / "capture_graph.dot"
-                        capture_dot_path = maybe_dot if maybe_dot.exists() else None
-                        stage_status["capture"] = "ok"
-                    except Exception as exc:
+                    spec = capture_model_spec(
+                        model_name,
+                        seed=model_seed,
+                        artifacts_dir=model_dir,
+                        write_debug_dot=True,
+                    )
+                    maybe_dot = model_dir / "capture_graph.dot"
+                    capture_dot_path = maybe_dot if maybe_dot.exists() else None
+                    stage_status["capture"] = "ok"
+                else:  # auto
+                    if supports_live_capture(model_name):
+                        try:
+                            spec = capture_model_spec(
+                                model_name,
+                                seed=model_seed,
+                                artifacts_dir=model_dir,
+                                write_debug_dot=True,
+                            )
+                            maybe_dot = model_dir / "capture_graph.dot"
+                            capture_dot_path = maybe_dot if maybe_dot.exists() else None
+                            stage_status["capture"] = "ok"
+                        except Exception as exc:
+                            spec = get_model_spec(model_name, seed=model_seed)
+                            stage_status["capture"] = "mock"
+                            capture_note = (
+                                "Live capture failed, using static fixture graph. "
+                                f"Reason: {exc}"
+                            )
+                    else:
                         spec = get_model_spec(model_name, seed=model_seed)
                         stage_status["capture"] = "mock"
                         capture_note = (
-                            "Live capture failed, using static fixture graph. "
-                            f"Reason: {exc}"
+                            "Live capture unavailable for this model; using static fixture graph."
                         )
-                else:
-                    spec = get_model_spec(model_name, seed=model_seed)
-                    stage_status["capture"] = "mock"
-                    capture_note = "Live capture unavailable for this model; using static fixture graph."
 
             if spec is None:
                 raise RuntimeError("Internal error: model spec was not resolved after capture stage.")
@@ -400,41 +453,64 @@ def main() -> None:
             np.savez(model_dir / "inputs.npz", **spec.inputs)
             np.savez(model_dir / "expected_outputs.npz", **spec.expected)
 
-            normalized_graph = normalize_graph(spec.graph)
+            with timed_stage(stage_timings, "normalize"):
+                normalized_graph = normalize_graph(spec.graph)
             stage_status["normalize"] = "ok"
 
-            inferred = infer_graph_specs(normalized_graph)
-            inference_summary = summarize_inference(inferred)
+            with timed_stage(stage_timings, "type_infer"):
+                inferred = infer_graph_specs(normalized_graph)
+                inference_summary = summarize_inference(inferred)
             stage_status["type_infer"] = "ok"
 
-            unsupported = unsupported_op_details(normalized_graph)
-            ensure_supported(normalized_graph)
+            with timed_stage(stage_timings, "support_check"):
+                unsupported = unsupported_op_details(normalized_graph)
+                ensure_supported(normalized_graph)
             stage_status["support_check"] = "ok"
 
-            program = build_mil_program(normalized_graph, deployment_target=target, normalize=False)
+            with timed_stage(stage_timings, "lower"):
+                program = build_mil_program(
+                    normalized_graph,
+                    deployment_target=target,
+                    normalize=False,
+                    target_profile=args.target_profile,
+                )
             stage_status["lower"] = "ok"
             (model_dir / "program.mil.txt").write_text(str(program) + "\n", encoding="utf-8")
 
-            converted = convert_program_to_model(
-                program,
-                deployment_target=target,
-                convert_to=args.convert_to,
-            )
-            converted.save(str(model_path))
+            with timed_stage(stage_timings, "convert"):
+                converted = convert_program_to_model(
+                    program,
+                    deployment_target=target,
+                    convert_to=args.convert_to,
+                )
+                converted.save(str(model_path))
             stage_status["convert"] = "ok"
 
             if not args.skip_compile:
-                compiled_path = compile_model_artifact(model_path, model_dir / "model.mlmodelc")
+                with timed_stage(stage_timings, "compile"):
+                    compiled_path = compile_model_artifact(model_path, model_dir / "model.mlmodelc")
                 stage_status["compile"] = "ok"
+                if stage_status["placement_analysis"] == "pending":
+                    try:
+                        with timed_stage(stage_timings, "placement_analysis"):
+                            placement_analysis = analyze_compiled_model_placement(
+                                compiled_path,
+                                compute_units="all",
+                            )
+                        stage_status["placement_analysis"] = "ok"
+                    except Exception as exc:  # pragma: no cover - environment dependent
+                        placement_error = str(exc)
+                        stage_status["placement_analysis"] = "failed"
                 if args.eval_compiled:
-                    parity_stats = _evaluate_compiled_outputs(
-                        compiled_path=compiled_path,
-                        inputs=spec.inputs,
-                        expected=spec.expected,
-                        output_order=spec.graph.outputs,
-                        atol=max(args.atol, spec.atol),
-                        rtol=max(args.rtol, spec.rtol),
-                    )
+                    with timed_stage(stage_timings, "eval"):
+                        parity_stats = _evaluate_compiled_outputs(
+                            compiled_path=compiled_path,
+                            inputs=spec.inputs,
+                            expected=spec.expected,
+                            output_order=spec.graph.outputs,
+                            atol=max(args.atol, spec.atol),
+                            rtol=max(args.rtol, spec.rtol),
+                        )
                     stage_status["eval"] = "ok"
         except UnsupportedOpsError as exc:
             stage_status["support_check"] = "failed"
@@ -447,6 +523,7 @@ def main() -> None:
                     stage_status[failed_stage] = "failed"
             error_message = str(exc)
 
+        stage_durations_sec, total_duration_sec = summarize_stage_timings(stage_timings)
         report = _build_model_report(
             run_context=run_context,
             model_name=spec.name if spec is not None else model_name,
@@ -454,9 +531,21 @@ def main() -> None:
             seed=model_seed,
             graph_ops=[node.op for node in spec.graph.nodes] if spec is not None else [],
             stage_status=stage_status,
+            stage_durations_sec=stage_durations_sec,
+            total_duration_sec=total_duration_sec,
             model_path=model_path,
             capture_dot_path=capture_dot_path,
             compiled_path=compiled_path,
+            fallback_op_count=(
+                int(placement_analysis["fallback_operation_count"])
+                if placement_analysis is not None
+                else None
+            ),
+            top_fallback_ops=(
+                placement_analysis.get("top_fallback_ops", []) if placement_analysis is not None else []
+            ),
+            placement_analysis=placement_analysis,
+            placement_error=placement_error,
             parity_stats=parity_stats,
             inference_summary=inference_summary,
             unsupported_details=unsupported,

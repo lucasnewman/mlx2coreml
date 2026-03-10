@@ -128,6 +128,20 @@ def _primitive_attrs_from_arguments(
         attrs["axis1"] = int(arguments[0])
         attrs["axis2"] = int(arguments[1])
 
+    if op in {"slice", "slice_update", "sliceupdate"}:
+        if len(arguments) >= 1:
+            begin = _int_list(arguments[0])
+            if begin is not None:
+                attrs["begin"] = begin
+        if len(arguments) >= 2:
+            end = _int_list(arguments[1])
+            if end is not None:
+                attrs["end"] = end
+        if len(arguments) >= 3:
+            stride = _int_list(arguments[2])
+            if stride is not None:
+                attrs["stride"] = stride
+
     if op in {"sum", "mean", "min", "max", "prod", "all", "any", "var", "std", "logsumexp"}:
         if arguments:
             axes = _int_list(arguments[0])
@@ -138,6 +152,16 @@ def _primitive_attrs_from_arguments(
         if op in {"var", "std"} and len(arguments) >= 3:
             attrs["ddof"] = int(arguments[2])
 
+    if op == "reduce":
+        if arguments:
+            attrs["mode"] = int(arguments[0])
+        if len(arguments) >= 2:
+            axes = _int_list(arguments[1])
+            if axes is not None:
+                attrs["axes"] = axes
+        # MLX callback Reduce currently emits rank-preserving reductions.
+        attrs["keep_dims"] = bool(arguments[2]) if len(arguments) >= 3 else True
+
     if op in {"argmax", "argmin"}:
         if arguments:
             attrs["axis"] = int(arguments[0])
@@ -146,6 +170,24 @@ def _primitive_attrs_from_arguments(
 
     if op in {"take", "take_along_axis"} and arguments:
         attrs["axis"] = int(arguments[0])
+
+    if op == "split" and arguments:
+        split_arg = arguments[0]
+        if isinstance(split_arg, (list, tuple)):
+            attrs["split_indices"] = [int(v) for v in split_arg]
+        else:
+            attrs["num_splits"] = int(split_arg)
+        if len(arguments) >= 2:
+            axis = _int_list(arguments[1])
+            if axis:
+                attrs["axis"] = int(axis[0])
+        else:
+            attrs["axis"] = 0
+
+    if op == "expanddims" and arguments:
+        axes = _int_list(arguments[0])
+        if axes is not None:
+            attrs["axes"] = axes
 
     if op == "gather" and arguments:
         axes = _int_list(arguments[0])
@@ -195,6 +237,38 @@ def _primitive_attrs_from_arguments(
             attrs["do_causal"] = bool(state[1])
             attrs["has_sinks"] = bool(state[2])
             attrs["output_logsumexp"] = bool(state[3])
+
+    if op == "convolution" and arguments:
+        strides = _int_list(arguments[0])
+        if strides is not None:
+            attrs["strides"] = strides
+
+        if len(arguments) >= 2:
+            pad_lo = _int_list(arguments[1])
+            if pad_lo is not None:
+                attrs["padding"] = pad_lo
+                attrs["pad_type"] = "custom"
+
+        if len(arguments) >= 3:
+            pad_hi = _int_list(arguments[2])
+            if pad_hi is not None:
+                pad_lo = attrs.get("padding")
+                if isinstance(pad_lo, list) and len(pad_lo) == len(pad_hi):
+                    attrs["padding"] = [int(lo) + int(hi) for lo, hi in zip(pad_lo, pad_hi)]
+
+        if len(arguments) >= 4:
+            dilations = _int_list(arguments[3])
+            if dilations is not None:
+                attrs["dilations"] = dilations
+
+        if len(arguments) >= 6:
+            try:
+                attrs["groups"] = int(arguments[5])
+            except Exception:
+                pass
+
+        if len(arguments) >= 7 and isinstance(arguments[6], (bool, np.bool_)):
+            attrs["transpose"] = bool(arguments[6])
 
     if op == "arange" and len(arguments) >= 3:
         attrs["start"] = int(arguments[0])

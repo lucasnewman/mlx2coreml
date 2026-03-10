@@ -111,6 +111,25 @@ class PipelineAndDiagnosticsTests(unittest.TestCase):
         self.assertIn("value", normalized.nodes[0].attrs)
         self.assertEqual(normalized.nodes[0].attrs["value"], [1.0, 2.0])
 
+    def test_normalization_keeps_large_constant_arrays_uninlined(self) -> None:
+        graph = Graph(
+            inputs=[],
+            nodes=[
+                Node(
+                    "Const",
+                    tuple(),
+                    "c0",
+                    attrs={"val": np.arange(129, dtype=np.float32)},
+                )
+            ],
+            outputs=["c0"],
+        )
+        graph.validate()
+        normalized = normalize_graph(graph)
+        self.assertEqual(normalized.nodes[0].op, "constant")
+        self.assertIsInstance(normalized.nodes[0].attrs["value"], np.ndarray)
+        self.assertEqual(normalized.nodes[0].attrs["value"].shape, (129,))
+
     def test_inference_tracks_shape_and_dtype(self) -> None:
         graph = Graph(
             inputs=[TensorSpec("x", (2, 3), "fp32"), TensorSpec("y", (2, 3), "fp32")],
@@ -130,6 +149,53 @@ class PipelineAndDiagnosticsTests(unittest.TestCase):
         self.assertEqual(inferred["m"].shape, (2,))
         self.assertEqual(inferred["a"].dtype, "int32")
         self.assertGreaterEqual(summary["with_shape"], 4)
+
+    def test_sdpa_mask_attrs_are_canonicalized(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("q", (1, 2, 4, 8), "fp32"),
+                TensorSpec("k", (1, 2, 4, 8), "fp32"),
+                TensorSpec("v", (1, 2, 4, 8), "fp32"),
+                TensorSpec("m", (1, 1, 4, 4), "fp32"),
+            ],
+            nodes=[
+                Node(
+                    "ScaledDotProductAttention",
+                    ("q", "k", "v", "m"),
+                    "out",
+                    attrs={"do_causal": 1, "scale": "0.5", "mask_mode": "BOOL"},
+                )
+            ],
+            outputs=["out"],
+        )
+        graph.validate()
+        normalized = normalize_graph(graph)
+        attrs = normalized.nodes[0].attrs
+        self.assertEqual(normalized.nodes[0].op, "scaled_dot_product_attention")
+        self.assertEqual(attrs["do_causal"], True)
+        self.assertEqual(attrs["scale"], 0.5)
+        self.assertEqual(attrs["mask_mode"], "bool")
+
+    def test_sdpa_without_mask_sets_mask_mode_none(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("q", (1, 2, 4, 8), "fp32"),
+                TensorSpec("k", (1, 2, 4, 8), "fp32"),
+                TensorSpec("v", (1, 2, 4, 8), "fp32"),
+            ],
+            nodes=[
+                Node(
+                    "scaled_dot_product_attention",
+                    ("q", "k", "v"),
+                    "out",
+                    attrs={"do_causal": False},
+                )
+            ],
+            outputs=["out"],
+        )
+        graph.validate()
+        normalized = normalize_graph(graph)
+        self.assertEqual(normalized.nodes[0].attrs["mask_mode"], "none")
 
 
 if __name__ == "__main__":

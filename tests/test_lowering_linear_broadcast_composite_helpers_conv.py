@@ -71,6 +71,29 @@ class LoweringLinearBroadcastCompositeHelpersConvTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_mil_program(graph)
 
+    def test_convolution_channels_last_depthwise_pattern_lowers(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (1, 9, 4), "fp32"),
+                TensorSpec("w", (4, 3, 1), "fp32"),
+            ],
+            nodes=[
+                Node(
+                    "convolution",
+                    ("x", "w"),
+                    "out",
+                    attrs={"strides": [1], "padding": [0], "dilations": [1], "groups": 4},
+                )
+            ],
+            outputs=["out"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("conv(", text)
+        self.assertIn("transpose(", text)
+
 
 if __name__ == "__main__":
     unittest.main()

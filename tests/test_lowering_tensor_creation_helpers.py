@@ -58,6 +58,17 @@ class LoweringTensorCreationHelpersTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_mil_program(graph)
 
+    def test_full_materialization_variant_lowers_as_identity(self) -> None:
+        graph = Graph(
+            inputs=[TensorSpec("x", (2, 3), "fp32")],
+            nodes=[Node("full", ("x",), "f")],
+            outputs=["f"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        self.assertIn("identity(", str(program))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,16 @@ class TensorSpec:
 
 
 @dataclass(frozen=True)
+class StateSpec:
+    name: str
+    shape: tuple[int, ...]
+    dtype: str = "fp16"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "shape": list(self.shape), "dtype": self.dtype}
+
+
+@dataclass(frozen=True)
 class Node:
     op: str
     inputs: tuple[str, ...]
