@@ -1,12 +1,10 @@
 # mlx2coreml
 
-`mlx2coreml` is an experimental MLX -> Core ML translation pipeline.
+`mlx2coreml` is a MLX -> Core ML translation pipeline.
 
-It captures MLX graphs, normalizes them into a small IR, lowers to MIL, and converts to Core ML artifacts (`.mlpackage` / `.mlmodelc`).
+It captures MLX graphs and converts them to to Core ML models (`.mlpackage` / `.mlmodelc`), suitable for on-device deployment through Xcode.
 
-## Docs
-
-- [docs/ops_status.md](./docs/ops_status.md): Supported op status
+*mlx2coreml is still experimental and may not work with all models.*
 
 ## Quick Start
 
@@ -76,3 +74,7 @@ coreml_model.model.save(model_path)
 
 compiled_path = m2c.compile_mlmodel(model_path, "model.mlmodelc")
 ```
+
+## Docs
+
+- [docs/ops_status.md](./docs/ops_status.md): Supported op status
