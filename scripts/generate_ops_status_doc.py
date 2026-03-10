@@ -83,23 +83,23 @@ NOT_SUPPORTED: tuple[NotSupportedRow, ...] = (
     ),
     NotSupportedRow(
         "from_fp8",
-        "**Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project.",
+        "Non-`fp16`/`fp32` quantization path is out of scope.",
     ),
     NotSupportedRow(
         "gather_qmm",
-        "**Policy: not supported.** Quantized qmm-family op is out of scope for this project.",
+        "Quantized qmm-family op is out of scope.",
     ),
     NotSupportedRow(
         "qqmm",
-        "**Policy: not supported.** Quantized qmm-family op is out of scope for this project.",
+        "Quantized qmm-family op is out of scope.",
     ),
     NotSupportedRow(
         "quantized_matmul",
-        "**Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project.",
+        "Non-`fp16`/`fp32` quantization path is out of scope.",
     ),
     NotSupportedRow(
         "to_fp8",
-        "**Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project.",
+        "Non-`fp16`/`fp32` quantization path is out of scope.",
     ),
     NotSupportedRow(
         "view",

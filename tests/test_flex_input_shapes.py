@@ -1,29 +1,20 @@
-import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import coremltools as ct
 import numpy as np
 
+from mlx2coreml import convert_mlx_lm
 from mlx2coreml.ir import Graph, Node, TensorSpec
-
-
-def _load_convert_script_module():
-    repo_root = Path(__file__).resolve().parents[1]
-    module_path = repo_root / "scripts" / "convert_mlx_lm_to_coreml.py"
-    spec = importlib.util.spec_from_file_location("convert_mlx_lm_to_coreml", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 class FlexInputShapeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.module = _load_convert_script_module()
+        cls.module = convert_mlx_lm
 
     def test_parse_flex_lengths_auto_includes_one_and_seq_len(self) -> None:
         parsed = self.module._parse_flex_lengths("auto", seq_len=16)
@@ -34,6 +25,16 @@ class FlexInputShapeTests(unittest.TestCase):
         self.assertEqual(parsed, [1, 4, 8])
         with self.assertRaises(ValueError):
             self.module._parse_flex_lengths("0,8", seq_len=8)
+
+    def test_parse_args_uses_output_directory(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["convert_mlx_lm_to_coreml.py", "--model-id", "mlx-community/foo", "--output", "outdir"],
+        ):
+            args = self.module.parse_args()
+        self.assertEqual(args.model_id, "mlx-community/foo")
+        self.assertEqual(args.output, Path("outdir"))
 
     def test_build_conversion_inputs_applies_enumerated_shapes_to_target_inputs(self) -> None:
         specs = [

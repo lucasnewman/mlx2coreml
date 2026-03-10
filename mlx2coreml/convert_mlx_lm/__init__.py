@@ -1,23 +1,20 @@
+from __future__ import annotations
+
 import argparse
 import json
-import re
-import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from mlx2coreml.compute_plan import analyze_compiled_model_placement
-from mlx2coreml.compilation import compile_mlmodel
-from mlx2coreml.conversion import (
+from ..compilation import compile_mlmodel
+from ..compute_plan import analyze_compiled_model_placement
+from ..conversion import (
     ConversionConfig,
     build_conversion_inputs as _build_conversion_inputs,
     capture_mlx_graph,
     collect_unsupported_details,
+    convert_lowered_program,
     ensure_graph_supported,
     find_extra_input_names,
     load_state_specs as _load_state_specs,
@@ -28,8 +25,8 @@ from mlx2coreml.conversion import (
     summarize_graph_inference,
     temporary_capture_training_mode as _temporary_capture_training_mode,
 )
-from mlx2coreml.ir import Graph
-from mlx2coreml.reporting import (
+from ..ir import Graph
+from ..reporting import (
     build_run_context,
     init_stage_timings,
     summarize_stage_timings,
@@ -72,15 +69,10 @@ def parse_args() -> argparse.Namespace:
         help="Pass lazy=True to mlx_lm.load().",
     )
     parser.add_argument(
-        "--artifacts-dir",
+        "--output",
         type=Path,
-        default=Path("artifacts"),
-        help="Base artifacts directory.",
-    )
-    parser.add_argument(
-        "--run-name",
-        default=None,
-        help="Optional run folder name. Defaults to sanitized model id.",
+        required=True,
+        help="Output directory written exactly as provided.",
     )
     parser.add_argument(
         "--capture-mode",
@@ -185,12 +177,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
-
-
-def _sanitize_run_name(model_id: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id.strip())
-    sanitized = sanitized.strip("._-")
-    return sanitized or "mlx_lm_convert"
 
 
 def _tokenize_prompt(tokenizer: Any, prompt: str, seq_len: int) -> np.ndarray:
@@ -340,8 +326,7 @@ def main() -> None:
         flex_input_names=set(flex_input_names),
     )
 
-    run_name = args.run_name or _sanitize_run_name(args.model_id)
-    run_dir = args.artifacts_dir / run_name
+    run_dir = args.output
     run_dir.mkdir(parents=True, exist_ok=True)
 
     dot_path = run_dir / "capture_graph.dot"
@@ -362,6 +347,7 @@ def main() -> None:
         seed=0,
     )
     run_context["model_id"] = args.model_id
+    run_context["output"] = str(args.output)
     run_context["capture_mode"] = args.capture_mode
     run_context["target_profile"] = args.target_profile
     run_context["compute_precision"] = args.compute_precision
@@ -584,7 +570,7 @@ def main() -> None:
         raise RuntimeError(error_message)
 
     print(f"Model: {args.model_id}")
-    print(f"Run dir: {run_dir}")
+    print(f"Output dir: {run_dir}")
     print(f"Wrote DOT graph: {dot_path}")
     print(f"Wrote graph JSON: {graph_json_path}")
     print(f"Wrote inputs: {inputs_path}")
@@ -597,7 +583,13 @@ def main() -> None:
         print(f"Wrote compiled model: {saved_compiled_path}")
     print(f"Wrote report markdown: {report_md_path}")
     print(f"Wrote report json: {report_json_path}")
-
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "_build_conversion_inputs",
+    "_load_state_specs",
+    "_normalize_graph_for_function",
+    "_parse_flex_input_names",
+    "_parse_flex_lengths",
+    "_temporary_capture_training_mode",
+    "main",
+    "parse_args",
+]

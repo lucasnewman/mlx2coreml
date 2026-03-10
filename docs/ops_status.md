@@ -1,6 +1,6 @@
 # Ops Status (MLX -> MIL)
 
-- Supported: **125**
+- Supported: **137**
 - Not yet implemented: **37**
 - Not supported: **7**
 
@@ -41,12 +41,16 @@
 | `conv_transpose1d` | `conv_transpose` |
 | `conv_transpose2d` | `conv_transpose` |
 | `conv_transpose3d` | `conv_transpose` |
+| `convolution` | `conv` |
 | `copy` | `identity` |
 | `degrees` | `degrees` |
 | `diag` | `diag` |
 | `diagonal` | `diagonal` |
 | `divide` | `real_div` |
 | `divmod` | `divmod` |
+| `exp` | `exp` |
+| `expand_dims` | `expand_dims` |
+| `expanddims` | `expand_dims` |
 | `expm1` | `expm1` |
 | `eye` | `eye` |
 | `flatten` | `flatten` |
@@ -56,6 +60,8 @@
 | `full_like` | `full_like` |
 | `gather` | `gather` |
 | `greater` | `greater` |
+| `greater_equal` | `greater_equal` |
+| `greaterequal` | `greater_equal` |
 | `inner` | `inner` |
 | `inverse` | `inverse` |
 | `isclose` | `isclose` |
@@ -92,8 +98,10 @@
 | `power` | `pow` |
 | `prod` | `reduce_prod` |
 | `radians` | `radians` |
+| `read_state` | `read_state` |
 | `real_div` | `real_div` |
 | `reciprocal` | `inverse` |
+| `reduce` | `reduce` |
 | `reduce_argmax` | `reduce_argmax` |
 | `reduce_argmin` | `reduce_argmin` |
 | `reduce_max` | `reduce_max` |
@@ -112,8 +120,11 @@
 | `slice` | `slice_by_index` |
 | `slice_by_index` | `slice_by_index` |
 | `slice_update` | `slice_update` |
+| `sliceupdate` | `slice_update` |
 | `softmax` | `softmax` |
+| `split` | `split` |
 | `squeeze` | `squeeze` |
+| `state_update_masked` | `state_update_masked` |
 | `std` | `std` |
 | `stop_gradient` | `identity` |
 | `sub` | `sub` |
@@ -131,6 +142,7 @@
 | `unflatten` | `unflatten` |
 | `var` | `var` |
 | `where` | `select` |
+| `write_state` | `coreml_update_state` |
 | `zeros` | `zeros` |
 | `zeros_like` | `zeros_like` |
 
@@ -181,9 +193,9 @@
 | MLX Op | Reason |
 | --- | --- |
 | `depends` | Control-dependency semantics are not representable in the current MIL lowering model. |
-| `from_fp8` | **Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project. |
-| `gather_qmm` | **Policy: not supported.** Quantized qmm-family op is out of scope for this project. |
-| `qqmm` | **Policy: not supported.** Quantized qmm-family op is out of scope for this project. |
-| `quantized_matmul` | **Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project. |
-| `to_fp8` | **Policy: not supported.** Non-`fp16`/`fp32` quantization path is out of scope for this project. |
+| `from_fp8` | Non-`fp16`/`fp32` quantization path is out of scope. |
+| `gather_qmm` | Quantized qmm-family op is out of scope. |
+| `qqmm` | Quantized qmm-family op is out of scope. |
+| `quantized_matmul` | Non-`fp16`/`fp32` quantization path is out of scope. |
+| `to_fp8` | Non-`fp16`/`fp32` quantization path is out of scope. |
 | `view` | Stride-aware view semantics are not representable in MIL (outside contiguous reshape-compatible cases). |

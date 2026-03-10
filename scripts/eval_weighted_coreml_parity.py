@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         "--run-dir",
         type=Path,
         default=Path("artifacts/llama32_1b_package"),
-        help="Artifact directory from scripts/convert_mlx_lm_to_coreml.py.",
+        help="Artifact directory from mlx2coreml.convert conversion runs.",
     )
     parser.add_argument(
         "--model-id",

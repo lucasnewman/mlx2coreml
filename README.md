@@ -11,37 +11,37 @@ It captures MLX graphs, normalizes them into a small IR, lowers to MIL, and conv
 ## Quick Start
 
 ```bash
-pip install -U coremltools mlx mlx-lm numpy
+pip install -U mlx2coreml
 ```
 
 ## Examples
 
-### Converting MLX-LM models to CoreML
+### Converting [MLX LM](https://github.com/ml-explore/mlx-lm/tree/main) models to CoreML
 
 ```bash
-python scripts/convert_mlx_lm_to_coreml.py \
+python -m mlx2coreml.convert_mlx_lm \
   --model-id mlx-community/Qwen3-0.6B-bf16 \
+  --output qwen3_0_6b_coreml \
   --seq-len 128 \
   --deployment-target iOS18 \
   --convert-to mlprogram \
   --compute-precision fp16 \
-  --compute-units all \
-  --run-name qwen3_0_6b_coreml
+  --compute-units all
 ```
-
-Outputs are written under `artifacts/<run-name>/`
 
 ### Direct conversion from Python
 
-For custom pipelines, use the higher-level conversion API directly:
+For arbitrary models, use the conversion API directly:
 
 ```python
 import numpy as np
 import mlx.core as mx
+
 from mlx_lm import load
+
 import mlx2coreml as m2c
 
-# Load the MLX model
+# Load an MLX model
 
 model_id = "mlx-community/Qwen3-0.6B-bf16"
 mlx_model, tokenizer = load(model_id, lazy=False)

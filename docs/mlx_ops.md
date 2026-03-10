@@ -2,7 +2,7 @@
 
 Source: `https://raw.githubusercontent.com/ml-explore/mlx/main/mlx/ops.h`
 
-Total unique ops: **183**
+Total unique ops: **184**
 
 | Op | Overloads in `ops.h` |
 | --- | ---: |
@@ -30,6 +30,7 @@ Total unique ops: **183**
 | `atleast_1d` | 2 |
 | `atleast_2d` | 2 |
 | `atleast_3d` | 2 |
+| `bartlett` | 1 |
 | `bitwise_and` | 1 |
 | `bitwise_invert` | 1 |
 | `bitwise_or` | 1 |
@@ -193,5 +194,5 @@ Total unique ops: **183**
 ## MIL Overlap
 
 - Shared names: **50**
-- MLX-only names: **133**
+- MLX-only names: **134**
 - MIL-only names: **118**

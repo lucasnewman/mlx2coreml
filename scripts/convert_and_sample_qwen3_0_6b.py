@@ -416,20 +416,18 @@ def _build_fixed_input_ids(
 
 def _run_conversion(args: argparse.Namespace, *, run_dir: Path, prompt_len: int) -> dict[str, Any]:
     flex_lens = _build_flex_input_lens(prompt_len, int(args.max_new_tokens), int(args.seq_len))
-    converter_script = REPO_ROOT / "scripts" / "convert_mlx_lm_to_coreml.py"
     cmd = [
         sys.executable,
-        str(converter_script),
+        "-m",
+        "mlx2coreml.convert_mlx_lm",
         "--model-id",
         str(args.model_id),
         "--prompt",
         str(args.prompt),
         "--seq-len",
         str(int(args.seq_len)),
-        "--artifacts-dir",
-        str(args.artifacts_dir.resolve()),
-        "--run-name",
-        str(args.run_name),
+        "--output",
+        str(run_dir),
         "--deployment-target",
         str(args.deployment_target),
         "--target-profile",
