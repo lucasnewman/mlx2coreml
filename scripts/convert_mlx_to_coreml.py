@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import re
 import sys
@@ -15,18 +16,18 @@ from mlx2coreml.compute_plan import analyze_compiled_model_placement
 from mlx2coreml.compilation import compile_mlmodel
 from mlx2coreml.conversion import (
     ConversionConfig,
-    build_conversion_inputs as _build_conversion_inputs,
     capture_mlx_graph,
     collect_unsupported_details,
+    convert_lowered_program,
     ensure_graph_supported,
     find_extra_input_names,
-    load_state_specs as _load_state_specs,
+    load_state_specs,
     lower_graph_to_mil,
-    normalize_graph_for_conversion as _normalize_graph_for_function,
+    normalize_graph_for_conversion,
     parse_flex_input_names,
     parse_flex_lengths,
     summarize_graph_inference,
-    temporary_capture_training_mode as _temporary_capture_training_mode,
+    temporary_capture_training_mode,
 )
 from mlx2coreml.ir import Graph
 from mlx2coreml.reporting import (
@@ -41,35 +42,29 @@ from mlx2coreml.reporting import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert an mlx-lm text model to Core ML via MLX capture -> IR normalize -> "
-            "MIL lower -> Core ML convert -> optional compile."
+            "Convert a generic MLX Python callable to Core ML via MLX capture -> IR normalize -> "
+            "MIL lower -> Core ML convert -> optional compile. The callable is invoked as "
+            "function(**inputs) using tensors loaded from --inputs."
         )
     )
     parser.add_argument(
-        "--model-id",
+        "--module",
         required=True,
-        help="Hugging Face model id loadable with mlx_lm.load().",
+        help="Python module path containing the target callable.",
     )
     parser.add_argument(
-        "--prompt",
-        default="hello",
-        help="Prompt text used to build the input_ids capture batch.",
+        "--function",
+        required=True,
+        help=(
+            "Callable attribute path inside --module (for example: forward, model, model.forward). "
+            "The resolved object must be callable."
+        ),
     )
     parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=16,
-        help="Token sequence length used for input_ids (truncate/pad).",
-    )
-    parser.add_argument(
-        "--revision",
-        default=None,
-        help="Optional Hugging Face revision passed to mlx_lm.load().",
-    )
-    parser.add_argument(
-        "--lazy-load",
-        action="store_true",
-        help="Pass lazy=True to mlx_lm.load().",
+        "--inputs",
+        type=Path,
+        required=True,
+        help="Path to .npz inputs where each key matches a callable argument name.",
     )
     parser.add_argument(
         "--artifacts-dir",
@@ -80,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-name",
         default=None,
-        help="Optional run folder name. Defaults to sanitized model id.",
+        help="Optional run folder name. Defaults to a sanitized module/function name.",
     )
     parser.add_argument(
         "--capture-mode",
@@ -154,16 +149,16 @@ def parse_args() -> argparse.Namespace:
         "--flex-input-lens",
         default=None,
         help=(
-            "Optional comma-separated token lengths for flexible input shapes "
-            "(for example: 1,16,64). Use 'auto' to enable preset [1, seq_len]."
+            "Optional comma-separated lengths to substitute along the last axis for flexible "
+            "input shapes (for example: 1,16,64)."
         ),
     )
     parser.add_argument(
         "--flex-input-names",
-        default="input_ids,attention_mask,position_ids,token_type_ids",
+        default="",
         help=(
-            "Comma-separated input names eligible for flexible sequence length handling "
-            "when --flex-input-lens is enabled."
+            "Comma-separated input names eligible for flexible last-axis handling. If omitted "
+            "and --flex-input-lens is set, all rank >= 1 inputs are considered."
         ),
     )
     parser.add_argument(
@@ -180,77 +175,68 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Temporarily set the MLX model to training mode during graph export capture. "
-            "Useful for models whose eval path uses fast custom kernels that are harder to lower."
+            "Temporarily set the resolved callable object to training mode during capture when "
+            "it exposes train/eval or training/is_training attributes."
         ),
     )
     return parser.parse_args()
 
 
-def _sanitize_run_name(model_id: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id.strip())
+def _sanitize_run_name(module_name: str, function_name: str) -> str:
+    combined = f"{module_name.strip()}_{function_name.strip()}"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", combined)
     sanitized = sanitized.strip("._-")
-    return sanitized or "mlx_lm_convert"
+    return sanitized or "mlx_convert"
 
 
-def _tokenize_prompt(tokenizer: Any, prompt: str, seq_len: int) -> np.ndarray:
-    if seq_len <= 0:
-        raise ValueError(f"--seq-len must be positive, got {seq_len}.")
-
-    token_ids = [int(v) for v in tokenizer.encode(prompt)]
-    if not token_ids:
-        raise ValueError("Tokenizer produced an empty prompt token sequence.")
-
-    if len(token_ids) > seq_len:
-        token_ids = token_ids[:seq_len]
-    elif len(token_ids) < seq_len:
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        if eos_id is None:
-            eos_id = token_ids[-1]
-        token_ids = token_ids + [int(eos_id)] * (seq_len - len(token_ids))
-
-    return np.asarray([token_ids], dtype=np.int32)
+def _resolve_attr_path(root: Any, attr_path: str) -> Any:
+    current = root
+    for part in [segment.strip() for segment in str(attr_path).split(".") if segment.strip()]:
+        current = getattr(current, part, None)
+        if current is None:
+            raise ValueError(f"Attribute path '{attr_path}' could not be resolved.")
+    return current
 
 
-def _select_primary_output(value: Any) -> Any:
-    if isinstance(value, dict):
-        if not value:
-            raise ValueError("Model returned an empty dict output.")
-        return next(iter(value.values()))
-    if isinstance(value, (list, tuple)):
-        if not value:
-            raise ValueError("Model returned an empty sequence output.")
-        return value[0]
-    return value
+def _load_callable(module_name: str, function_name: str):
+    module = importlib.import_module(module_name)
+    fn = _resolve_attr_path(module, function_name)
+    if not callable(fn):
+        raise ValueError(
+            f"Resolved attribute '{function_name}' from module '{module_name}' is not callable."
+        )
+    return fn
 
 
-def _parse_flex_lengths(raw: str | None, *, seq_len: int) -> list[int] | None:
-    parsed = parse_flex_lengths(raw, preset_values=[1, int(seq_len)])
-    if parsed is None:
+def _load_inputs_npz(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path) as loaded:
+        return {name: np.asarray(loaded[name]) for name in loaded.files}
+
+
+def _parse_flex_lengths(raw: str | None) -> list[int] | None:
+    if raw is None or not str(raw).strip():
         return None
-    normalized: list[int] = []
-    for value in [1, *parsed, int(seq_len)]:
-        if int(value) <= 0:
-            raise ValueError(f"--flex-input-lens values must be positive, got {value}.")
-        ivalue = int(value)
-        if ivalue not in normalized:
-            normalized.append(ivalue)
-    return normalized
+    return parse_flex_lengths(raw)
 
 
 def _parse_flex_input_names(raw: str) -> set[str]:
     return parse_flex_input_names(raw)
 
 
+_load_state_specs = load_state_specs
+_normalize_graph_for_function = normalize_graph_for_conversion
+_temporary_capture_training_mode = temporary_capture_training_mode
+
+
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     top_ops_str = ", ".join(f"`{name}` x{count}" for name, count in report["top_ops"])
     compiled = report["artifacts"]["compiled"]
     lines = [
-        "# Weighted Model Probe Report",
+        "# MLX Callable Conversion Report",
         "",
-        f"- Model: `{report['model_id']}`",
-        f"- Prompt: `{report['prompt']}`",
-        f"- Seq length: `{report['seq_len']}`",
+        f"- Module: `{report['module']}`",
+        f"- Function: `{report['function']}`",
+        f"- Source inputs: `{report['source_inputs_npz']}`",
         f"- Status: `{report['status']}`",
         f"- Stage status: `{json.dumps(report['stage_status'], sort_keys=True)}`",
         f"- Stage durations (sec): `{json.dumps(report['stage_durations_sec'], sort_keys=True)}`",
@@ -284,7 +270,9 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     if compiled:
         lines.append(f"- Compiled artifact: `{compiled}`")
     if report.get("flex_input_shapes"):
-        lines.append(f"- Flexible input shapes: `{json.dumps(report['flex_input_shapes'], sort_keys=True)}`")
+        lines.append(
+            f"- Flexible input shapes: `{json.dumps(report['flex_input_shapes'], sort_keys=True)}`"
+        )
     if report["extra_input_names_sample"]:
         lines.append(
             f"- Extra input names sample: `{', '.join(report['extra_input_names_sample'])}`"
@@ -323,7 +311,7 @@ def main() -> None:
     skip_lower = bool(args.skip_lower)
     skip_convert = bool(args.skip_convert or skip_lower)
     skip_compile = bool(args.skip_compile or skip_convert)
-    flex_input_lens = _parse_flex_lengths(args.flex_input_lens, seq_len=int(args.seq_len))
+    flex_input_lens = _parse_flex_lengths(args.flex_input_lens)
     flex_input_names = _parse_flex_input_names(args.flex_input_names)
     state_specs = _load_state_specs(args.state_specs_json)
     conversion_config = ConversionConfig(
@@ -340,7 +328,7 @@ def main() -> None:
         flex_input_names=set(flex_input_names),
     )
 
-    run_name = args.run_name or _sanitize_run_name(args.model_id)
+    run_name = args.run_name or _sanitize_run_name(args.module, args.function)
     run_dir = args.artifacts_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -356,20 +344,18 @@ def main() -> None:
     report_md_path = run_dir / "report.md"
 
     run_context = build_run_context(
-        run_kind="mlx_lm_weighted_probe",
+        run_kind="mlx_callable_convert",
         deployment_target=args.deployment_target,
         convert_to=args.convert_to,
         seed=0,
     )
-    run_context["model_id"] = args.model_id
+    run_context["module"] = args.module
+    run_context["function"] = args.function
+    run_context["source_inputs_npz"] = str(args.inputs.resolve())
     run_context["capture_mode"] = args.capture_mode
     run_context["target_profile"] = args.target_profile
     run_context["compute_precision"] = args.compute_precision
     run_context["compute_units"] = args.compute_units
-    run_context["prompt"] = args.prompt
-    run_context["seq_len"] = int(args.seq_len)
-    run_context["revision"] = args.revision
-    run_context["lazy_load"] = bool(args.lazy_load)
     run_context["allow_unknown_sources"] = bool(args.allow_unknown_sources)
     run_context["capture_is_training"] = bool(args.capture_is_training)
     run_context["analyze_placement"] = bool(args.analyze_placement)
@@ -380,8 +366,8 @@ def main() -> None:
     write_json(run_context_path, run_context)
 
     stage_status = {
-        "load_model": "pending",
-        "tokenize": "pending",
+        "load_callable": "pending",
+        "load_inputs": "pending",
         "capture": "pending",
         "normalize": "pending",
         "type_infer": "pending",
@@ -414,28 +400,24 @@ def main() -> None:
     converted = None
 
     try:
-        with timed_stage(stage_timings, "load_model"):
-            from mlx_lm import load
+        with timed_stage(stage_timings, "load_callable"):
+            function = _load_callable(args.module, args.function)
+        stage_status["load_callable"] = "ok"
 
-            model, tokenizer = load(args.model_id, lazy=args.lazy_load, revision=args.revision)
-            if hasattr(model, "eval"):
-                model.eval()
-        stage_status["load_model"] = "ok"
-
-        with timed_stage(stage_timings, "tokenize"):
-            input_ids = _tokenize_prompt(tokenizer, args.prompt, args.seq_len)
-            inputs = {"input_ids": input_ids}
-        stage_status["tokenize"] = "ok"
+        with timed_stage(stage_timings, "load_inputs"):
+            source_inputs = _load_inputs_npz(args.inputs)
+            if not source_inputs:
+                raise ValueError(f"--inputs {args.inputs} did not contain any arrays.")
+        stage_status["load_inputs"] = "ok"
 
         with timed_stage(stage_timings, "capture"):
             captured = capture_mlx_graph(
-                model,
-                inputs,
+                function,
+                source_inputs,
                 dot_output_path=dot_path,
                 capture_mode=conversion_config.capture_mode,
                 allow_unknown_sources=conversion_config.allow_unknown_sources,
                 capture_is_training=conversion_config.capture_is_training,
-                capture_function=lambda input_ids: _select_primary_output(model(input_ids)),
             )
             graph = captured.graph
             normalized_inputs = captured.normalized_inputs
@@ -531,11 +513,11 @@ def main() -> None:
     )
     report_json = {
         "schema_version": run_context["schema_version"],
-        "run_kind": "mlx_lm_weighted_probe",
+        "run_kind": "mlx_callable_convert",
         "run_context": run_context,
-        "model_id": args.model_id,
-        "prompt": args.prompt,
-        "seq_len": int(args.seq_len),
+        "module": args.module,
+        "function": args.function,
+        "source_inputs_npz": str(args.inputs.resolve()),
         "capture_mode": args.capture_mode,
         "main_function": main_function_name,
         "inference_by_function": inference_by_function,
@@ -566,6 +548,7 @@ def main() -> None:
         "top_ops": op_counts,
         "inference": inference_summary,
         "artifacts": {
+            "source_inputs": str(args.inputs.resolve()),
             "capture_dot": str(dot_path),
             "graph_json": str(graph_json_path),
             "inputs": str(inputs_path),
@@ -583,11 +566,13 @@ def main() -> None:
     if error_message is not None:
         raise RuntimeError(error_message)
 
-    print(f"Model: {args.model_id}")
+    print(f"Module: {args.module}")
+    print(f"Function: {args.function}")
     print(f"Run dir: {run_dir}")
+    print(f"Source inputs: {args.inputs.resolve()}")
     print(f"Wrote DOT graph: {dot_path}")
     print(f"Wrote graph JSON: {graph_json_path}")
-    print(f"Wrote inputs: {inputs_path}")
+    print(f"Wrote normalized inputs: {inputs_path}")
     print(f"Wrote expected outputs: {expected_path}")
     if not skip_lower:
         print(f"Wrote MIL program: {mil_path}")

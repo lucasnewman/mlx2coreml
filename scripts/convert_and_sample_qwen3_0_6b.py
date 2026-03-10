@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mlx2coreml.lower_to_mil import compile_model_artifact  # noqa: E402
+from mlx2coreml.compilation import compile_mlmodel  # noqa: E402
 from mlx2coreml.reporting import build_run_context, write_json  # noqa: E402
 
 
@@ -175,9 +175,9 @@ def _resolve_compiled_path(
     if compiled_path.exists():
         return compiled_path, 0.0, False, "run_dir"
     compile_start = time.perf_counter()
-    compiled = compile_model_artifact(model_path, compiled_path)
+    compiled = compile_mlmodel(model_path, compiled_path)
     compile_sec = float(time.perf_counter() - compile_start)
-    return compiled, compile_sec, True, "compile_model_artifact"
+    return compiled, compile_sec, True, "compile_mlmodel"
 
 
 def _resolve_model_input_seq_len(model_path: Path, *, input_name: str = "input_ids") -> int | None:

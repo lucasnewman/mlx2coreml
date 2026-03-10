@@ -19,9 +19,9 @@ from mlx2coreml.from_mlx import (
     make_mock_smoke_graph,
 )
 from mlx2coreml.compute_plan import analyze_compiled_model_placement
+from mlx2coreml.compilation import compile_mlmodel
 from mlx2coreml.lower_to_mil import (
     build_mil_program,
-    compile_model_artifact,
     convert_program_to_model,
 )
 from mlx2coreml.op_registry import ensure_supported
@@ -309,7 +309,7 @@ def main() -> None:
 
         if not args.skip_compile:
             with timed_stage(stage_timings, "compile"):
-                compiled_out = compile_model_artifact(model_path, compiled_path)
+                compiled_out = compile_mlmodel(model_path, compiled_path)
             stage_status["compile"] = "ok"
             if stage_status["placement_analysis"] == "pending":
                 try:

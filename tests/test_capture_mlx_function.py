@@ -9,6 +9,39 @@ from mlx2coreml.passes import normalize_graph
 
 
 class CaptureMlxFunctionTests(unittest.TestCase):
+    def test_capture_callback_without_dot_output_path(self) -> None:
+        import mlx.core as mx
+
+        inputs = {"x": np.asarray([[1.0, 2.0]], dtype=np.float32)}
+
+        graph, _, expected = capture_graph_from_mlx_function(
+            dot_output_path=None,
+            inputs=inputs,
+            function=lambda x: mx.add(x, x),
+        )
+
+        self.assertEqual([node.op for node in graph.nodes], ["add"])
+        self.assertEqual(len(graph.outputs), 1)
+        output_name = graph.outputs[0]
+        self.assertTrue(np.allclose(expected[output_name], np.asarray([[2.0, 4.0]], dtype=np.float32)))
+
+    def test_capture_dot_mode_without_dot_output_path(self) -> None:
+        import mlx.core as mx
+
+        inputs = {"x": np.asarray([[1.0, 2.0]], dtype=np.float32)}
+
+        graph, _, expected = capture_graph_from_mlx_function(
+            dot_output_path=None,
+            inputs=inputs,
+            function=lambda x: mx.add(x, x),
+            capture_mode="dot",
+        )
+
+        self.assertEqual([node.op for node in graph.nodes], ["add"])
+        self.assertEqual(len(graph.outputs), 1)
+        output_name = graph.outputs[0]
+        self.assertTrue(np.allclose(expected[output_name], np.asarray([[2.0, 4.0]], dtype=np.float32)))
+
     def test_capture_swiglu_gated_silu_graph(self) -> None:
         import mlx.core as mx
 

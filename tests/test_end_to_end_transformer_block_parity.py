@@ -6,10 +6,10 @@ from pathlib import Path
 import coremltools as ct
 import numpy as np
 
+from mlx2coreml.compilation import compile_mlmodel
 from mlx2coreml.from_mlx import capture_graph_from_mlx_function
 from mlx2coreml.lower_to_mil import (
     build_mil_program,
-    compile_model_artifact,
     convert_program_to_model,
 )
 from mlx2coreml.op_registry import ensure_supported
@@ -189,7 +189,7 @@ class EndToEndTransformerBlockParityTests(unittest.TestCase):
         )
         model_path = artifacts_dir / "transformer_block.mlpackage"
         model.save(str(model_path))
-        compiled_path = compile_model_artifact(model_path, artifacts_dir / "transformer_block.mlmodelc")
+        compiled_path = compile_mlmodel(model_path, artifacts_dir / "transformer_block.mlmodelc")
 
         compiled = ct.models.CompiledMLModel(str(compiled_path))
         outputs = compiled.predict(inputs)

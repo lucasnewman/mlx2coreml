@@ -13,9 +13,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mlx2coreml.compute_plan import analyze_compiled_model_placement  # noqa: E402
+from mlx2coreml.compilation import compile_mlmodel  # noqa: E402
 from mlx2coreml.lower_to_mil import (  # noqa: E402
     build_mil_program,
-    compile_model_artifact,
     convert_program_to_model,
 )
 from tests.model_zoo import (  # noqa: E402
@@ -488,7 +488,7 @@ def main() -> None:
 
             if not args.skip_compile:
                 with timed_stage(stage_timings, "compile"):
-                    compiled_path = compile_model_artifact(model_path, model_dir / "model.mlmodelc")
+                    compiled_path = compile_mlmodel(model_path, model_dir / "model.mlmodelc")
                 stage_status["compile"] = "ok"
                 if stage_status["placement_analysis"] == "pending":
                     try:

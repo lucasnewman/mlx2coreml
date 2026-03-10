@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mlx2coreml.lower_to_mil import compile_model_artifact
+from mlx2coreml.compilation import compile_mlmodel
 from mlx2coreml.reporting import build_run_context, write_json
 
 
@@ -199,7 +199,7 @@ def main() -> None:
     model_path = _resolve_model_path(probe_report, run_dir)
     compiled_path = run_dir / "model.mlmodelc"
     if not args.skip_compile:
-        compiled_path = compile_model_artifact(model_path, compiled_path)
+        compiled_path = compile_mlmodel(model_path, compiled_path)
     elif not compiled_path.exists():
         raise FileNotFoundError(
             f"--skip-compile set but compiled artifact not found: {compiled_path}"

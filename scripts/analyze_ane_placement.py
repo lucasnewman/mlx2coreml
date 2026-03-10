@@ -13,7 +13,7 @@ from mlx2coreml.compute_plan import (  # noqa: E402
     ComputePlanUnavailableError,
     analyze_compiled_model_placement,
 )
-from mlx2coreml.lower_to_mil import compile_model_artifact  # noqa: E402
+from mlx2coreml.compilation import compile_mlmodel  # noqa: E402
 from mlx2coreml.reporting import write_json  # noqa: E402
 
 
@@ -158,7 +158,7 @@ def main() -> None:
         }
     else:
         if args.compiled_path is not None:
-            compiled_out = compile_model_artifact(model_path, args.compiled_path.resolve())
+            compiled_out = compile_mlmodel(model_path, args.compiled_path.resolve())
             analysis = _analyze_from_compiled(
                 compiled_out,
                 compute_units=args.compute_units,
@@ -174,7 +174,7 @@ def main() -> None:
         else:
             with TemporaryDirectory(prefix="mlx2coreml_placement_") as temp_dir:
                 compiled_temp = Path(temp_dir) / "model.mlmodelc"
-                compiled_out = compile_model_artifact(model_path, compiled_temp)
+                compiled_out = compile_mlmodel(model_path, compiled_temp)
                 analysis = _analyze_from_compiled(
                     compiled_out,
                     compute_units=args.compute_units,

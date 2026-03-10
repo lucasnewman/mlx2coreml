@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import shutil
-from pathlib import Path
 from typing import Iterable
 
 import coremltools as ct
@@ -2382,17 +2380,3 @@ def convert_program_to_model(
             retry_kwargs.pop("states", None)
             return ct.convert(program, **retry_kwargs)
         raise
-
-
-def compile_model_artifact(model_path: Path, compiled_path: Path | None = None) -> Path:
-    model_path = Path(model_path).resolve()
-    compiled_temp = Path(ct.models.utils.compile_model(str(model_path))).resolve()
-    if compiled_path is None:
-        return compiled_temp
-
-    compiled_path = Path(compiled_path).resolve()
-    if compiled_path.exists():
-        shutil.rmtree(compiled_path)
-    compiled_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(compiled_temp, compiled_path)
-    return compiled_path

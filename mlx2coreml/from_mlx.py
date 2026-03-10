@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import re
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
 import numpy as np
@@ -666,8 +668,18 @@ def _normalize_outputs(outputs: Any) -> list[Any]:
     return [outputs]
 
 
+@contextmanager
+def _temporary_dot_output_path(dot_output_path: Path | None):
+    if dot_output_path is not None:
+        yield Path(dot_output_path)
+        return
+
+    with TemporaryDirectory(prefix="mlx2coreml_dot_") as temp_dir:
+        yield Path(temp_dir) / "capture.dot"
+
+
 def _capture_graph_from_precomputed_outputs(
-    dot_output_path: Path,
+    dot_output_path: Path | None,
     numpy_inputs: dict[str, np.ndarray],
     mx_inputs: dict[str, Any],
     outputs: Any,
@@ -675,23 +687,24 @@ def _capture_graph_from_precomputed_outputs(
     input_specs: list[TensorSpec] | None = None,
     allow_unknown_sources: bool = False,
 ) -> tuple[Graph, dict[str, np.ndarray], dict[str, np.ndarray]]:
-    dot_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_values = _normalize_outputs(outputs)
 
     if not output_values:
         raise ValueError("capture requires at least one output.")
 
-    if len(output_values) == 1:
-        # MLX import is intentionally lazy to allow non-live operation in restricted envs.
-        import mlx.core as mx  # noqa: PLC0415
+    with _temporary_dot_output_path(dot_output_path) as resolved_dot_output_path:
+        resolved_dot_output_path.parent.mkdir(parents=True, exist_ok=True)
+        if len(output_values) == 1:
+            # MLX import is intentionally lazy to allow non-live operation in restricted envs.
+            import mlx.core as mx  # noqa: PLC0415
 
-        mx.export_to_dot(str(dot_output_path), output_values[0], **mx_inputs)
-    else:
-        import mlx.core as mx  # noqa: PLC0415
+            mx.export_to_dot(str(resolved_dot_output_path), output_values[0], **mx_inputs)
+        else:
+            import mlx.core as mx  # noqa: PLC0415
 
-        mx.export_to_dot(str(dot_output_path), *output_values, **mx_inputs)
+            mx.export_to_dot(str(resolved_dot_output_path), *output_values, **mx_inputs)
 
-    dot_text = dot_output_path.read_text(encoding="utf-8")
+        dot_text = resolved_dot_output_path.read_text(encoding="utf-8")
     parser_specs = input_specs if input_specs is not None else _default_input_specs(numpy_inputs)
     graph = parse_mlx_dot_to_graph(
         dot_text,
@@ -718,7 +731,7 @@ def _capture_graph_from_precomputed_outputs(
 
 
 def _capture_graph_from_mlx_function_callback(
-    dot_output_path: Path,
+    dot_output_path: Path | None,
     numpy_inputs: dict[str, np.ndarray],
     mx_inputs: dict[str, Any],
     function: Callable[..., Any],
@@ -760,7 +773,7 @@ def _capture_graph_from_mlx_function_callback(
             f"but {len(expected_arrays)} outputs were provided."
         )
 
-    if write_dot_debug:
+    if write_dot_debug and dot_output_path is not None:
         dot_output_path.parent.mkdir(parents=True, exist_ok=True)
         if len(output_values) == 1:
             mx.export_to_dot(str(dot_output_path), output_values[0], **mx_inputs)
@@ -775,7 +788,7 @@ def _capture_graph_from_mlx_function_callback(
 
 
 def capture_graph_from_mlx_outputs(
-    dot_output_path: Path,
+    dot_output_path: Path | None,
     inputs: dict[str, Any],
     outputs: Any,
     *,
@@ -786,7 +799,7 @@ def capture_graph_from_mlx_outputs(
     Capture a DOT graph from precomputed MLX outputs and parse into translator IR.
 
     Args:
-        dot_output_path: Target DOT file path.
+        dot_output_path: Optional DOT file path. When omitted, a temporary file is used.
         inputs: Named input tensors/arrays used to produce outputs.
         outputs: Single output tensor, sequence of output tensors, or dict of outputs.
         input_specs: Optional explicit input specs used by DOT parser.
@@ -808,7 +821,7 @@ def capture_graph_from_mlx_outputs(
 
 
 def capture_graph_from_mlx_function(
-    dot_output_path: Path,
+    dot_output_path: Path | None,
     inputs: dict[str, Any],
     function: Callable[..., Any],
     *,
@@ -840,7 +853,7 @@ def capture_graph_from_mlx_function(
             function=function,
             input_specs=input_specs,
             allow_unknown_sources=allow_unknown_sources,
-            write_dot_debug=True,
+            write_dot_debug=dot_output_path is not None,
         )
 
     if capture_mode == "dot":

@@ -16,7 +16,7 @@ pip install -U coremltools mlx mlx-lm numpy
 
 ## Examples
 
-### Convert `mlx-community/Qwen3-0.6B-bf16` to CoreML
+### Converting MLX-LM models to CoreML
 
 ```bash
 python scripts/convert_mlx_lm_to_coreml.py \
@@ -31,77 +31,48 @@ python scripts/convert_mlx_lm_to_coreml.py \
 
 Outputs are written under `artifacts/<run-name>/`
 
-### Convert + Sample Qwen3-0.6B
+### Direct conversion from Python
 
-```bash
-python scripts/convert_and_sample_qwen3_0_6b.py \
-  --prompt "Write one short sentence about ANE acceleration." \
-  --seq-len 96 \
-  --max-new-tokens 16 \
-  --validate-steps 4
-```
-
-This converts `mlx-community/Qwen3-0.6B-bf16`, samples generated tokens from the compiled
-Core ML model, and validates early decode steps against MLX next-token argmax.
-
-### Python API
-
-For custom pipelines, you can use the python API directly:
+For custom pipelines, use the higher-level conversion API directly:
 
 ```python
-from pathlib import Path
-
-import coremltools as ct
 import numpy as np
+import mlx.core as mx
 from mlx_lm import load
+import mlx2coreml as m2c
 
-from mlx2coreml.from_mlx import capture_graph_from_mlx_function
-from mlx2coreml.lower_to_mil import (
-    build_mil_program,
-    compile_model_artifact,
-    convert_program_to_model,
-)
-from mlx2coreml.passes import normalize_graph
-
-
-def build_input_ids(tokenizer, prompt: str, seq_len: int) -> np.ndarray:
-    # TODO: tokenize prompt and truncate/pad to `seq_len`, dtype int32.
-    ...
-
-
-def select_primary_output(model_output):
-    # TODO: if dict/list/tuple, pick a single tensor to capture.
-    ...
-
+# Load the MLX model
 
 model_id = "mlx-community/Qwen3-0.6B-bf16"
-prompt = "hello"
+mlx_model, tokenizer = load(model_id, lazy=False)
+
+# Build sample inputs for conversion
+
 seq_len = 128
-out_dir = Path("artifacts/my_run")
-out_dir.mkdir(parents=True, exist_ok=True)
+prompt = "hello"
+input_ids = mx.array(tokenizer.encode(prompt), dtype=mx.int32)[None, ...]
+inputs = {"input_ids": input_ids}
 
-model, tokenizer = load(model_id, lazy=False)
-inputs = {"input_ids": build_input_ids(tokenizer, prompt, seq_len)}
+# Convert the model to a CoreML .mlprogram
 
-graph, normalized_inputs, expected = capture_graph_from_mlx_function(
-    dot_output_path=out_dir / "capture_graph.dot",
-    inputs=inputs,
-    function=lambda input_ids: select_primary_output(model(input_ids)),
-    allow_unknown_sources=True,
-    capture_mode="callback",
-)
-
-graph = normalize_graph(graph)
-program = build_mil_program(graph, deployment_target=ct.target.iOS18, normalize=False)
-coreml_model = convert_program_to_model(
-    program,
-    deployment_target=ct.target.iOS18,
+config = m2c.ConversionConfig(
+    deployment_target="iOS18",
     convert_to="mlprogram",
+    compute_precision="fp16",
+    flex_input_lens=[1, seq_len],
+    flex_input_names={"input_ids"},
 )
 
-model_path = out_dir / "model.mlpackage"
-coreml_model.save(str(model_path))
-compiled_path = compile_model_artifact(model_path, out_dir / "model.mlmodelc")
+coreml_model = m2c.convert_mlx_to_coreml(
+    mlx_model,
+    inputs,
+    config=config,
+    capture_function=lambda input_ids: mlx_model(input_ids),
+)
+model_path = "model.mlpackage"
+coreml_model.model.save(model_path)
 
-print("Compiled model:", compiled_path)
+# Optional: compile the model to a CoreML .mlmodelc
+
+compiled_path = m2c.compile_mlmodel(model_path, "model.mlmodelc")
 ```
