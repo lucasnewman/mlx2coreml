@@ -119,21 +119,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--argmax-in-model",
-        default="off",
-        choices=["off", "index", "index_and_value"],
-        help=(
-            "Pass through to conversion script: optionally reduce model outputs "
-            "to argmax index (or index+value) to reduce host transfer size."
-        ),
-    )
-    parser.add_argument(
-        "--argmax-axis",
-        type=int,
-        default=-1,
-        help="Axis used when --argmax-in-model is enabled during conversion.",
-    )
-    parser.add_argument(
         "--analyze-placement",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -305,76 +290,12 @@ def _normalize_model_output(value: Any) -> np.ndarray:
     return _to_numpy(value)
 
 
-def _extract_token_from_argmax_indices(indices: np.ndarray, *, position: int | None) -> int:
-    arr = np.asarray(indices)
-    if arr.size == 0:
-        raise ValueError("Argmax indices tensor is empty.")
-
-    if arr.ndim == 0:
-        return int(arr.item())
-    if arr.ndim == 1:
-        vector = arr.reshape(-1)
-    else:
-        # Expected shape for reduced decoder output is [batch, seq] with batch=1.
-        if int(arr.shape[0]) != 1:
-            raise ValueError(
-                f"Argmax index output expects batch dimension 1, got {arr.shape[0]}."
-            )
-        vector = arr.reshape(-1)
-
-    pos = vector.size - 1 if position is None else int(position)
-    if pos < 0:
-        pos += int(vector.size)
-    if pos < 0 or pos >= int(vector.size):
-        raise ValueError(
-            f"Requested argmax index position {position} out of range for length {vector.size}."
-        )
-    return int(vector[pos])
-
-
-def _resolve_argmax_reduction(report: dict[str, Any]) -> dict[str, Any]:
-    metadata = report.get("argmax_reduction")
-    if isinstance(metadata, dict) and bool(metadata.get("enabled")):
-        reduced_outputs = metadata.get("reduced_outputs")
-        if not isinstance(reduced_outputs, list):
-            reduced_outputs = []
-        return {
-            "enabled": True,
-            "mode": str(metadata.get("mode", "index")),
-            "axis": int(metadata.get("axis", -1)),
-            "source_output": metadata.get("source_output"),
-            "reduced_outputs": [str(name) for name in reduced_outputs],
-            "value_output": metadata.get("value_output"),
-        }
-
-    legacy_mode = str(report.get("argmax_in_model", "off"))
-    if legacy_mode in {"index", "index_and_value"}:
-        return {
-            "enabled": True,
-            "mode": legacy_mode,
-            "axis": int(report.get("argmax_axis", -1)),
-            "source_output": None,
-            "reduced_outputs": [],
-            "value_output": None,
-        }
-    return {"enabled": False, "mode": "off"}
-
-
 def _pick_output_tensor(
     predicted_raw: Any,
-    *,
-    preferred_name: str | None,
 ) -> np.ndarray:
     if isinstance(predicted_raw, dict):
         if not predicted_raw:
             raise RuntimeError("Core ML model returned no outputs.")
-        if preferred_name is not None and preferred_name in predicted_raw:
-            return _normalize_model_output(predicted_raw[preferred_name])
-        if preferred_name is not None and len(predicted_raw) != 1:
-            available = ", ".join(sorted(str(name) for name in predicted_raw.keys()))
-            raise KeyError(
-                f"Preferred model output '{preferred_name}' not found. Available outputs: {available}."
-            )
         return _normalize_model_output(next(iter(predicted_raw.values())))
     return _normalize_model_output(predicted_raw)
 
@@ -386,22 +307,8 @@ def _next_token_from_model_output(
     temperature: float,
     top_k: int,
     rng: np.random.Generator,
-    argmax_reduction: dict[str, Any],
 ) -> int:
-    if bool(argmax_reduction.get("enabled")):
-        if float(temperature) > 0.0:
-            raise ValueError(
-                "--argmax-in-model only supports greedy decode in this script; "
-                "set --temperature 0."
-            )
-        reduced_outputs = argmax_reduction.get("reduced_outputs")
-        preferred_name = None
-        if isinstance(reduced_outputs, list) and reduced_outputs:
-            preferred_name = str(reduced_outputs[0])
-        indices = _pick_output_tensor(predicted_raw, preferred_name=preferred_name)
-        return _extract_token_from_argmax_indices(indices, position=int(valid_len - 1))
-
-    logits = _pick_output_tensor(predicted_raw, preferred_name=None)
+    logits = _pick_output_tensor(predicted_raw)
     return _next_token_from_logits(
         logits,
         position=int(valid_len - 1),
@@ -535,10 +442,6 @@ def _run_conversion(args: argparse.Namespace, *, run_dir: Path, prompt_len: int)
         str(args.capture_mode),
         "--flex-input-lens",
         ",".join(str(v) for v in flex_lens),
-        "--argmax-in-model",
-        str(args.argmax_in_model),
-        "--argmax-axis",
-        str(int(args.argmax_axis)),
         "--analyze-placement" if bool(args.analyze_placement) else "--no-analyze-placement",
         "--allow-unknown-sources" if bool(args.allow_unknown_sources) else "--no-allow-unknown-sources",
         "--capture-is-training" if bool(args.capture_is_training) else "--no-capture-is-training",
@@ -588,7 +491,6 @@ def main() -> None:
         conversion_report = _run_conversion(args, run_dir=run_dir, prompt_len=len(prompt_tokens))
     else:
         conversion_report = _load_json(conversion_report_path)
-    argmax_reduction = _resolve_argmax_reduction(conversion_report)
 
     stateful_inspection = _inspect_stateful_ops(
         run_dir,
@@ -674,7 +576,6 @@ def main() -> None:
             temperature=float(args.temperature),
             top_k=int(args.top_k),
             rng=rng,
-            argmax_reduction=argmax_reduction,
         )
         decode_step_elapsed = float(time.perf_counter() - decode_step_start)
         decode_elapsed_sec += decode_step_elapsed
@@ -733,8 +634,6 @@ def main() -> None:
     run_context["validate_steps"] = int(validate_steps)
     run_context["temperature"] = float(args.temperature)
     run_context["top_k"] = int(args.top_k)
-    run_context["argmax_in_model"] = str(conversion_report.get("argmax_in_model", args.argmax_in_model))
-    run_context["argmax_axis"] = int(conversion_report.get("argmax_axis", args.argmax_axis))
     run_context["decode_mode"] = "full"
     run_context["decode_load_strategy"] = decode_load_strategy
     run_context["decode_supports_explicit_state"] = False
@@ -795,7 +694,6 @@ def main() -> None:
         "model_artifact": str(model_path),
         "compiled_artifact": str(compiled_path),
         "conversion_report": str(conversion_report_path.resolve()),
-        "argmax_reduction": argmax_reduction,
         "decode": decode_details,
         "performance": performance,
         "artifacts": {
@@ -835,8 +733,6 @@ def main() -> None:
         f"- Infer tokens/sec: `{infer_tokens_per_sec:.4f}`" if infer_tokens_per_sec is not None else "- Infer tokens/sec: `n/a`",
         f"- Time to first token (sec): `{time_to_first_token_sec:.4f}`" if time_to_first_token_sec is not None else "- Time to first token (sec): `n/a`",
         f"- Total tokens/sec: `{total_tokens_per_sec:.4f}`" if total_tokens_per_sec is not None else "- Total tokens/sec: `n/a`",
-        f"- Argmax in model: `{run_context['argmax_in_model']}`",
-        f"- Argmax axis: `{run_context['argmax_axis']}`",
         f"- Model artifact: `{model_path}`",
         f"- Compiled artifact: `{compiled_path}`",
         f"- JSON report: `{report_json_path}`",

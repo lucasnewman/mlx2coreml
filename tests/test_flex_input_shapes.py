@@ -66,48 +66,6 @@ class FlexInputShapeTests(unittest.TestCase):
         hidden_shape = tuple(int(v) for v in getattr(hidden_tensor.shape, "shape", ()))
         self.assertEqual(hidden_shape, (1, 16, 64))
 
-    def test_apply_argmax_output_reduction_index_and_value(self) -> None:
-        graph = Graph(
-            inputs=[TensorSpec(name="x", shape=(1, 2, 3), dtype="fp32")],
-            nodes=[Node(op="identity", inputs=("x",), output="logits")],
-            outputs=["logits"],
-        )
-        expected = {"logits": np.asarray([[[1.0, 4.0, 3.0], [2.0, 1.0, 5.0]]], dtype=np.float32)}
-        reduced_graph, reduced_expected, meta = self.module._apply_argmax_output_reduction(
-            graph,
-            expected,
-            mode="index_and_value",
-            axis=-1,
-        )
-        self.assertTrue(meta["enabled"])
-        self.assertEqual(meta["mode"], "index_and_value")
-        self.assertEqual(meta["axis"], 2)
-        self.assertEqual([node.op for node in reduced_graph.nodes[-2:]], ["argmax", "max"])
-        self.assertEqual(len(reduced_graph.outputs), 2)
-        self.assertEqual(
-            list(reduced_expected[reduced_graph.outputs[0]].tolist()),
-            [[1, 2]],
-        )
-        self.assertEqual(
-            list(reduced_expected[reduced_graph.outputs[1]].tolist()),
-            [[4.0, 5.0]],
-        )
-
-    def test_apply_argmax_output_reduction_rejects_bad_axis(self) -> None:
-        graph = Graph(
-            inputs=[TensorSpec(name="x", shape=(1, 2, 3), dtype="fp32")],
-            nodes=[Node(op="identity", inputs=("x",), output="logits")],
-            outputs=["logits"],
-        )
-        expected = {"logits": np.zeros((1, 2, 3), dtype=np.float32)}
-        with self.assertRaises(ValueError):
-            self.module._apply_argmax_output_reduction(
-                graph,
-                expected,
-                mode="index",
-                axis=4,
-            )
-
     def test_normalize_graph_for_function_uses_shared_pipeline(self) -> None:
         graph = Graph(
             inputs=[TensorSpec(name="x", shape=(1, 2, 3), dtype="fp32")],
@@ -115,15 +73,12 @@ class FlexInputShapeTests(unittest.TestCase):
             outputs=["logits"],
         )
         expected = {"logits": np.zeros((1, 2, 3), dtype=np.float32)}
-        normalized_graph, reduced_expected, argmax_meta, top_ops = self.module._normalize_graph_for_function(
+        normalized_graph, reduced_expected, top_ops = self.module._normalize_graph_for_function(
             graph,
             expected,
-            argmax_mode="off",
-            argmax_axis=-1,
         )
         self.assertEqual(normalized_graph.outputs, ["logits"])
         self.assertIn("logits", reduced_expected)
-        self.assertFalse(argmax_meta["enabled"])
         self.assertEqual(top_ops[0][0], "identity")
 
     def test_load_state_specs_parses_list_payload(self) -> None:

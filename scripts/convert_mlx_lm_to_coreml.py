@@ -21,7 +21,7 @@ from mlx2coreml.lower_to_mil import (
     compile_model_artifact,
     convert_program_to_model,
 )
-from mlx2coreml.ir import Graph, Node, StateSpec, TensorSpec
+from mlx2coreml.ir import Graph, StateSpec, TensorSpec
 from mlx2coreml.op_registry import ensure_supported, unsupported_op_details
 from mlx2coreml.passes import infer_graph_specs, normalize_graph, summarize_inference
 from mlx2coreml.reporting import (
@@ -169,21 +169,6 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated input names eligible for flexible sequence length handling "
             "when --flex-input-lens is enabled."
         ),
-    )
-    parser.add_argument(
-        "--argmax-in-model",
-        default="off",
-        choices=["off", "index", "index_and_value"],
-        help=(
-            "Optionally append argmax reduction to model outputs to reduce host transfer size. "
-            "'index' emits argmax indices only, 'index_and_value' emits both index and max value."
-        ),
-    )
-    parser.add_argument(
-        "--argmax-axis",
-        type=int,
-        default=-1,
-        help="Axis used for --argmax-in-model output reduction.",
     )
     parser.add_argument(
         "--allow-unknown-sources",
@@ -418,112 +403,13 @@ def _load_state_specs(path: Path | None) -> list[StateSpec] | None:
     return specs
 
 
-def _unique_tensor_name(base: str, taken: set[str]) -> str:
-    candidate = base
-    index = 1
-    while candidate in taken:
-        candidate = f"{base}_{index}"
-        index += 1
-    return candidate
-
-
-def _apply_argmax_output_reduction(
-    graph: Graph,
-    expected: dict[str, np.ndarray],
-    *,
-    mode: str,
-    axis: int,
-) -> tuple[Graph, dict[str, np.ndarray], dict[str, Any]]:
-    if mode == "off":
-        return graph, expected, {"enabled": False}
-    if mode not in {"index", "index_and_value"}:
-        raise ValueError(f"Unsupported argmax mode: {mode}")
-    if not graph.outputs:
-        raise ValueError("Cannot apply argmax output reduction: graph has no outputs.")
-    if not expected:
-        raise ValueError("Cannot apply argmax output reduction: expected outputs are empty.")
-
-    source_output = graph.outputs[0]
-    source_expected = np.asarray(next(iter(expected.values())))
-    if source_expected.ndim == 0:
-        raise ValueError(
-            "Cannot apply argmax output reduction to scalar output."
-        )
-    axis_norm = int(axis)
-    if axis_norm < 0:
-        axis_norm += source_expected.ndim
-    if axis_norm < 0 or axis_norm >= source_expected.ndim:
-        raise ValueError(
-            f"--argmax-axis out of range for output rank {source_expected.ndim}: {axis}"
-        )
-
-    taken_names = {spec.name for spec in graph.inputs}
-    taken_names.update(node.output for node in graph.nodes)
-    taken_names.update(graph.outputs)
-
-    index_output_name = _unique_tensor_name(f"{source_output}_argmax_idx", taken_names)
-    taken_names.add(index_output_name)
-
-    nodes = list(graph.nodes)
-    nodes.append(
-        Node(
-            op="argmax",
-            inputs=(source_output,),
-            output=index_output_name,
-            attrs={"axis": axis_norm, "keep_dims": False},
-        )
-    )
-    outputs = [index_output_name]
-    reduced_expected: dict[str, np.ndarray] = {
-        index_output_name: np.argmax(source_expected, axis=axis_norm).astype(np.int32),
-    }
-
-    value_output_name = None
-    if mode == "index_and_value":
-        value_output_name = _unique_tensor_name(f"{source_output}_argmax_val", taken_names)
-        nodes.append(
-            Node(
-                op="max",
-                inputs=(source_output,),
-                output=value_output_name,
-                attrs={"axes": [axis_norm], "keep_dims": False},
-            )
-        )
-        outputs.append(value_output_name)
-        reduced_expected[value_output_name] = np.max(source_expected, axis=axis_norm)
-
-    reduced_graph = Graph(inputs=list(graph.inputs), nodes=nodes, outputs=outputs)
-    reduced_graph.validate()
-    return (
-        reduced_graph,
-        reduced_expected,
-        {
-            "enabled": True,
-            "mode": mode,
-            "axis": axis_norm,
-            "source_output": source_output,
-            "reduced_outputs": list(outputs),
-            "value_output": value_output_name,
-        },
-    )
-
-
 def _normalize_graph_for_function(
     graph: Graph,
     expected: dict[str, np.ndarray],
-    *,
-    argmax_mode: str,
-    argmax_axis: int,
-) -> tuple[Graph, dict[str, np.ndarray], dict[str, Any], list[list[Any]]]:
+) -> tuple[Graph, dict[str, np.ndarray], list[list[Any]]]:
     normalized_graph = normalize_graph(graph)
-    normalized_graph, expected, argmax_reduction = _apply_argmax_output_reduction(
-        normalized_graph,
-        expected,
-        mode=argmax_mode,
-        axis=argmax_axis,
-    )
     graph_ops = [node.op for node in normalized_graph.nodes]
-    return normalized_graph, expected, argmax_reduction, _top_ops(graph_ops)
+    return normalized_graph, expected, _top_ops(graph_ops)
 
 
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
@@ -546,8 +432,6 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- Fallback ops: `{report['fallback_op_count']}`",
         f"- Capture mode: `{report['capture_mode']}`",
         f"- Target profile: `{report['run_context']['target_profile']}`",
-        f"- Argmax in model: `{report['argmax_in_model']}`",
-        f"- Argmax axis: `{report['argmax_axis']}`",
         f"- State specs: `{json.dumps(report['state_specs'])}`",
         f"- Deployment target: `{report['run_context']['deployment_target']}`",
         f"- Conversion backend: `{report['run_context']['convert_to']}`",
@@ -650,8 +534,6 @@ def main() -> None:
     run_context["flex_input_names"] = sorted(flex_input_names)
     run_context["state_specs_json"] = str(args.state_specs_json) if args.state_specs_json else None
     run_context["state_specs"] = [spec.to_dict() for spec in state_specs] if state_specs else []
-    run_context["argmax_in_model"] = args.argmax_in_model
-    run_context["argmax_axis"] = int(args.argmax_axis)
     write_json(run_context_path, run_context)
 
     stage_status = {
@@ -676,7 +558,6 @@ def main() -> None:
     extra_input_names: list[str] = []
     flex_input_shapes: dict[str, list[list[int]]] = {}
     inference_summary: dict[str, int] | None = None
-    argmax_reduction: dict[str, Any] = {"enabled": False}
     normalized_graph: Graph | None = None
     normalized_inputs: dict[str, np.ndarray] = {}
     expected: dict[str, np.ndarray] = {}
@@ -722,11 +603,9 @@ def main() -> None:
         np.savez(inputs_path, **normalized_inputs)
 
         with timed_stage(stage_timings, "normalize"):
-            normalized_graph, expected, argmax_reduction, op_counts = _normalize_graph_for_function(
+            normalized_graph, expected, op_counts = _normalize_graph_for_function(
                 graph,
                 expected,
-                argmax_mode=args.argmax_in_model,
-                argmax_axis=int(args.argmax_axis),
             )
         stage_status["normalize"] = "ok"
         np.savez(expected_path, **expected)
@@ -816,7 +695,6 @@ def main() -> None:
     weights_captured_as_constants = len(extra_input_names) == 0
     inference_by_function = {main_function_name: inference_summary} if inference_summary is not None else {}
     unsupported_by_function = {main_function_name: unsupported_details}
-    argmax_by_function = {main_function_name: argmax_reduction}
     flex_input_shapes_by_function = (
         {main_function_name: flex_input_shapes} if flex_input_shapes else {}
     )
@@ -829,10 +707,6 @@ def main() -> None:
         "seq_len": int(args.seq_len),
         "capture_mode": args.capture_mode,
         "main_function": main_function_name,
-        "argmax_in_model": args.argmax_in_model,
-        "argmax_axis": int(args.argmax_axis),
-        "argmax_reduction": argmax_reduction,
-        "argmax_by_function": argmax_by_function,
         "inference_by_function": inference_by_function,
         "unsupported_by_function": unsupported_by_function,
         "state_specs": [spec.to_dict() for spec in state_specs] if state_specs else [],
