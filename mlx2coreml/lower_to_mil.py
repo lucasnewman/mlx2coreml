@@ -220,6 +220,45 @@ def _infer_broadcast_shape(shapes: list[list[int]], node: Node) -> list[int]:
     return out
 
 
+def _broadcast_shapes(lhs: list[int], rhs: list[int]) -> list[int] | None:
+    out_rank = max(len(lhs), len(rhs))
+    out: list[int] = []
+    for axis in range(out_rank):
+        lhs_offset = axis - (out_rank - len(lhs))
+        rhs_offset = axis - (out_rank - len(rhs))
+        lhs_dim = int(lhs[lhs_offset]) if lhs_offset >= 0 else 1
+        rhs_dim = int(rhs[rhs_offset]) if rhs_offset >= 0 else 1
+        if lhs_dim == rhs_dim or lhs_dim == 1:
+            out.append(rhs_dim)
+            continue
+        if rhs_dim == 1:
+            out.append(lhs_dim)
+            continue
+        return None
+    return out
+
+
+def _matmul_output_shape(
+    lhs_shape: list[int],
+    rhs_shape: list[int],
+    *,
+    transpose_lhs: bool,
+    transpose_rhs: bool,
+) -> list[int] | None:
+    if len(lhs_shape) < 2 or len(rhs_shape) < 2:
+        return None
+    lhs_rows = int(lhs_shape[-1]) if transpose_lhs else int(lhs_shape[-2])
+    lhs_inner = int(lhs_shape[-2]) if transpose_lhs else int(lhs_shape[-1])
+    rhs_inner = int(rhs_shape[-1]) if transpose_rhs else int(rhs_shape[-2])
+    rhs_cols = int(rhs_shape[-2]) if transpose_rhs else int(rhs_shape[-1])
+    if lhs_inner != rhs_inner:
+        return None
+    batch = _broadcast_shapes(lhs_shape[:-2], rhs_shape[:-2])
+    if batch is None:
+        return None
+    return batch + [lhs_rows, rhs_cols]
+
+
 def _broadcast_tensor_to_shape(x: object, source_shape: list[int], target_shape: list[int], node: Node) -> object:
     x_expanded = x
     working_shape = list(source_shape)
@@ -1065,6 +1104,13 @@ def _parse_conv_pad(value: object | None, num_spatial_dims: int, node: Node) -> 
         )
     parsed = [int(v) for v in value]
     if len(parsed) == num_spatial_dims:
+        if node.op == "convolution":
+            out: list[int] = []
+            for total in parsed:
+                before = int(total) // 2
+                after = int(total) - before
+                out.extend([before, after])
+            return out
         out: list[int] = []
         for p in parsed:
             out.extend([p, p])
@@ -1142,8 +1188,10 @@ def _lower_conv_op(node: Node, env: dict[str, object], transpose: bool) -> objec
         )
     pad = _parse_conv_pad(raw_pad, num_spatial_dims, node)
 
-    # MLX callback capture frequently emits 1-D depthwise Convolution in channels-last form:
-    # x: [N, L, C], weight: [C, K, 1]. Convert to Core ML's channels-first conv and transpose back.
+    # MLX callback capture frequently emits 1-D convolution in channels-last form:
+    # x: [N, L, C]. For regular conv, weight is [O, K, C_in/groups].
+    # For some depthwise captures, weight is [C, K, 1] with groups omitted.
+    # Convert these cases to Core ML's channels-first conv and transpose back.
     x_shape_static = _shape_list_if_static(x)
     w_shape_static = _shape_list_if_static(weight)
     if (
@@ -1154,13 +1202,20 @@ def _lower_conv_op(node: Node, env: dict[str, object], transpose: bool) -> objec
         and len(x_shape_static) == 3
         and len(w_shape_static) == 3
     ):
-        channels = int(x_shape_static[-1])
-        if (
-            int(w_shape_static[0]) == channels
+        channels_first = int(x_shape_static[1])
+        channels_last = int(x_shape_static[2])
+        depthwise_channels_last = (
+            int(w_shape_static[0]) == channels_last
             and int(w_shape_static[2]) == 1
-            and (groups == 1 or groups == channels)
-        ):
-            groups = channels
+            and (groups == 1 or groups == channels_last)
+        )
+        generic_channels_last = (
+            int(w_shape_static[2]) * groups == channels_last
+            and int(w_shape_static[1]) * groups != channels_first
+        )
+        if depthwise_channels_last or generic_channels_last:
+            if depthwise_channels_last:
+                groups = channels_last
             x_ncl = mb.transpose(x=x, perm=[0, 2, 1], name=f"{node.output}_x_ncl")
 
             weight_val = getattr(weight, "val", None)
@@ -1306,6 +1361,39 @@ def _lower_node(
         return mb.softmax(x=env[node.inputs[0]], axis=axis, name=node.output)
     if mil_op == "sigmoid":
         return mb.sigmoid(x=env[node.inputs[0]], name=node.output)
+    if mil_op == "tanh":
+        return mb.tanh(x=_coerce_float_tensor(env[node.inputs[0]], node.output), name=node.output)
+    if mil_op == "erf":
+        return mb.erf(x=_coerce_float_tensor(env[node.inputs[0]], node.output), name=node.output)
+    if mil_op == "layernorm":
+        if len(node.inputs) < 2:
+            raise ValueError(
+                f"layernorm node '{node.output}' requires at least 2 inputs (x, weight)."
+            )
+        eps = float(node.attrs.get("eps", node.attrs.get("epsilon", 1e-5)))
+        x = env[node.inputs[0]]
+        w = env[node.inputs[1]]
+        x_work = mb.cast(x=x, dtype="fp32", name=f"{node.output}_x_fp32")
+        w_work = mb.cast(x=w, dtype="fp32", name=f"{node.output}_w_fp32")
+        rank = len(x_work.shape)
+        if rank == 0:
+            raise ValueError(f"layernorm node '{node.output}' requires rank >= 1 input.")
+        axes = [rank - 1]
+        mean = mb.reduce_mean(x=x_work, axes=axes, keep_dims=True, name=f"{node.output}_mean")
+        centered = mb.sub(x=x_work, y=mean, name=f"{node.output}_centered")
+        sq = mb.mul(x=centered, y=centered, name=f"{node.output}_sq")
+        var = mb.reduce_mean(x=sq, axes=axes, keep_dims=True, name=f"{node.output}_var")
+        denom = mb.add(x=var, y=eps, name=f"{node.output}_denom")
+        inv = mb.rsqrt(x=denom, name=f"{node.output}_inv")
+        norm = mb.mul(x=centered, y=inv, name=f"{node.output}_norm")
+        out = mb.mul(x=norm, y=w_work, name=f"{node.output}_scaled")
+        if len(node.inputs) >= 3:
+            b = mb.cast(x=env[node.inputs[2]], dtype="fp32", name=f"{node.output}_b_fp32")
+            out = mb.add(x=out, y=b, name=f"{node.output}_biased")
+        x_dtype = _dtype_name(x)
+        if "fp16" in x_dtype or "float16" in x_dtype:
+            return mb.cast(x=out, dtype="fp16", name=node.output)
+        return mb.identity(x=out, name=node.output)
     if mil_op == "rmsnorm":
         if len(node.inputs) < 2:
             raise ValueError(f"rmsnorm node '{node.output}' requires at least 2 inputs (x, weight).")
@@ -1795,12 +1883,39 @@ def _lower_node(
         transpose_mat1 = bool(node.attrs.get("transpose_mat1", False))
         transpose_mat2 = bool(node.attrs.get("transpose_mat2", False))
 
-        bias = env[node.inputs[0]]
-        mat1 = env[node.inputs[1]]
-        mat2 = env[node.inputs[2]]
+        terms = [env[name] for name in node.inputs]
+        resolved_bias = terms[0]
+        resolved_mat1 = terms[1]
+        resolved_mat2 = terms[2]
+        term_shapes = [_shape_list_if_static(term) for term in terms]
+        candidate_orders = [
+            (0, 1, 2),
+            (0, 2, 1),
+            (2, 0, 1),
+            (2, 1, 0),
+            (1, 0, 2),
+            (1, 2, 0),
+        ]
+        for bias_idx, mat1_idx, mat2_idx in candidate_orders:
+            bias_shape = term_shapes[bias_idx]
+            mat1_shape = term_shapes[mat1_idx]
+            mat2_shape = term_shapes[mat2_idx]
+            if bias_shape is None or mat1_shape is None or mat2_shape is None:
+                continue
+            out_shape = _matmul_output_shape(
+                mat1_shape,
+                mat2_shape,
+                transpose_lhs=transpose_mat1,
+                transpose_rhs=transpose_mat2,
+            )
+            if out_shape == bias_shape:
+                resolved_bias = terms[bias_idx]
+                resolved_mat1 = terms[mat1_idx]
+                resolved_mat2 = terms[mat2_idx]
+                break
         mm = mb.matmul(
-            x=mat1,
-            y=mat2,
+            x=resolved_mat1,
+            y=resolved_mat2,
             transpose_x=transpose_mat1,
             transpose_y=transpose_mat2,
             name=f"{node.output}_mm",
@@ -1808,8 +1923,8 @@ def _lower_node(
         if alpha != 1.0:
             mm = mb.mul(x=mm, y=alpha, name=f"{node.output}_alpha")
         if beta != 1.0:
-            bias = mb.mul(x=bias, y=beta, name=f"{node.output}_beta")
-        return mb.add(x=bias, y=mm, name=node.output)
+            resolved_bias = mb.mul(x=resolved_bias, y=beta, name=f"{node.output}_beta")
+        return mb.add(x=resolved_bias, y=mm, name=node.output)
     if mil_op == "broadcast_to":
         if len(node.inputs) != 1:
             raise ValueError(f"broadcast_to node '{node.output}' requires exactly 1 input.")

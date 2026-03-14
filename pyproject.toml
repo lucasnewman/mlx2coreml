@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx2coreml"
-version = "0.1.0"
+version = "0.1.1"
 description = "Experimental MLX to Core ML translation pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ classifiers = [
 dependencies = [
     "coremltools",
     "mlx",
+    "mlx-audio",
     "mlx-lm",
     "numpy",
 ]
@@ -45,6 +46,7 @@ Homepage = "https://github.com/lucasnewman/mlx2coreml"
 Repository = "https://github.com/lucasnewman/mlx2coreml"
 
 [project.scripts]
+mlx2coreml-convert-mlx-audio = "mlx2coreml.convert_mlx_audio:main"
 mlx2coreml-convert-mlx-lm = "mlx2coreml.convert_mlx_lm:main"
 
 [tool.setuptools]

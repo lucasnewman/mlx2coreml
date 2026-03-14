@@ -94,6 +94,53 @@ class LoweringLinearBroadcastCompositeHelpersConvTests(unittest.TestCase):
         self.assertIn("conv(", text)
         self.assertIn("transpose(", text)
 
+    def test_convolution_channels_last_regular_pattern_lowers(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (1, 9, 4), "fp32"),
+                TensorSpec("w", (6, 3, 4), "fp32"),
+                TensorSpec("b", (6,), "fp32"),
+            ],
+            nodes=[
+                Node(
+                    "convolution",
+                    ("x", "w", "b"),
+                    "out",
+                    attrs={"strides": [1], "padding": [1], "dilations": [1], "groups": 1},
+                )
+            ],
+            outputs=["out"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("conv(", text)
+        self.assertIn("transpose(", text)
+
+    def test_convolution_total_padding_from_capture_splits_per_side(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (1, 800, 80), "fp32"),
+                TensorSpec("w", (384, 3, 80), "fp32"),
+                TensorSpec("pos", (1, 800, 384), "fp32"),
+            ],
+            nodes=[
+                Node(
+                    "convolution",
+                    ("x", "w"),
+                    "conv",
+                    attrs={"strides": [1], "padding": [2], "dilations": [1], "groups": 1},
+                ),
+                Node("add", ("conv", "pos"), "out"),
+            ],
+            outputs=["out"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        self.assertIn("conv(", str(program))
+
 
 if __name__ == "__main__":
     unittest.main()

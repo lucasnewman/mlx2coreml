@@ -1,6 +1,6 @@
 # Ops Status (MLX -> MIL)
 
-- Supported: **137**
+- Supported: **140**
 - Not yet implemented: **37**
 - Not supported: **7**
 
@@ -48,6 +48,7 @@
 | `diagonal` | `diagonal` |
 | `divide` | `real_div` |
 | `divmod` | `divmod` |
+| `erf` | `erf` |
 | `exp` | `exp` |
 | `expand_dims` | `expand_dims` |
 | `expanddims` | `expand_dims` |
@@ -71,6 +72,7 @@
 | `isneginf` | `isneginf` |
 | `isposinf` | `isposinf` |
 | `kron` | `kron` |
+| `layernorm` | `layernorm` |
 | `less` | `less` |
 | `linspace` | `linspace` |
 | `log10` | `log10` |
@@ -133,6 +135,7 @@
 | `swapaxes` | `swapaxes` |
 | `take` | `gather` |
 | `take_along_axis` | `gather_along_axis` |
+| `tanh` | `tanh` |
 | `tensordot` | `tensordot` |
 | `trace` | `trace` |
 | `transpose` | `transpose` |

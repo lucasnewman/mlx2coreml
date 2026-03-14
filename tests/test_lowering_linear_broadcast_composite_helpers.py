@@ -50,6 +50,40 @@ class LoweringLinearBroadcastCompositeHelpers1Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_mil_program(graph)
 
+    def test_addmm_swaps_matmul_inputs_when_capture_orders_weight_before_activation(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("bias", (400, 384), "fp32"),
+                TensorSpec("weight", (384, 384), "fp32"),
+                TensorSpec("x", (400, 384), "fp32"),
+            ],
+            nodes=[Node("addmm", ("bias", "weight", "x"), "out")],
+            outputs=["out"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("matmul(", text)
+        self.assertIn("add(", text)
+
+    def test_addmm_accepts_capture_order_with_bias_last(self) -> None:
+        graph = Graph(
+            inputs=[
+                TensorSpec("x", (400, 384), "fp32"),
+                TensorSpec("weight", (384, 1536), "fp32"),
+                TensorSpec("bias", (400, 1536), "fp32"),
+            ],
+            nodes=[Node("addmm", ("x", "weight", "bias"), "out")],
+            outputs=["out"],
+        )
+        graph.validate()
+        ensure_supported(graph)
+        program = build_mil_program(graph)
+        text = str(program)
+        self.assertIn("matmul(", text)
+        self.assertIn("add(", text)
+
     def test_inner_requires_matching_last_dimension(self) -> None:
         graph = Graph(
             inputs=[TensorSpec("x", (2, 3), "fp32"), TensorSpec("y", (4, 2), "fp32")],
